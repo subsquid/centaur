@@ -29,6 +29,7 @@ class Grant < ApplicationRecord
 
   validate :exactly_one_grantee
   validate :exactly_one_grantable
+  validate :session_scoped_principal_holds_only_provider_keys
   validates :priority, presence: true, numericality: { only_integer: true }
 
   # The grantee this grant attaches the secret to: a principal or a role.
@@ -62,5 +63,17 @@ class Grant < ApplicationRecord
     set = GRANTABLE_ASSOCIATIONS.count { |assoc| send(assoc).present? }
     return if set == 1
     errors.add(:base, "must reference exactly one of #{GRANTABLE_ASSOCIATIONS.join(", ")}")
+  end
+
+  # A session-scoped principal (a user's personal, provider-key-only identity --
+  # see User#personal_principal) may hold ONLY provider-key static secrets. This
+  # is the "by construction" guard the multitenant design relies on: it keeps the
+  # session-execution principal credential-minimal so an injected thread context
+  # can at most spend the owner's LLM key, never reach other brokered secrets.
+  # Skipped for role grants and ordinary principals.
+  def session_scoped_principal_holds_only_provider_keys
+    return unless principal&.session_scoped?
+    return if static_secret&.provider_key?
+    errors.add(:base, "a session-scoped principal may only be granted provider-key secrets")
   end
 end

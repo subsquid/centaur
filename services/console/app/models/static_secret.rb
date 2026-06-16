@@ -40,6 +40,15 @@ class StaticSecret < ApplicationRecord
   has_many :rules, class_name: "RequestRule", dependent: :destroy
   belongs_to :created_by, class_name: "User"
 
+  # Whether this secret is one of the managed provider API keys (ANTHROPIC_API_KEY
+  # / OPENAI_API_KEY) -- i.e. a `replace` secret whose proxy_value is in the
+  # ProviderKey catalog. These are the ONLY secrets a session-scoped principal may
+  # be granted (enforced in Grant); the self-service provider-key page only ever
+  # creates this shape.
+  def provider_key?
+    replace_config.is_a?(Hash) && ProviderKey.proxy_value?(replace_config["proxy_value"])
+  end
+
   # Maps to a single entry in the iron-proxy `secrets` transform array. The
   # caller is responsible for skipping secrets without a source.
   def to_proxy_secret

@@ -65,6 +65,29 @@ module Api
         render json: body
       end
 
+      # GET /api/v1/principals/resolve_slack?email=
+      #
+      # Maps a Slack thread owner (by their verified Slack email) to the personal
+      # principal their sessions should run as, so slackbotv2 can fund a thread
+      # under that user's own provider key. Returns the user's opaque id, the
+      # principal's stable foreign_id, and whether a provider key is registered
+      # (so the bot runs vs. prompts onboarding). Read-only: never creates the
+      # principal. Marked no-store -- it reflects mutable user/grant state.
+      #
+      # RecordNotFound (no console user for the email) -> 404 via Api::BaseController.
+      def resolve_slack
+        email = params.require(:email).to_s.strip.downcase
+        user = User.find_by(email: email)
+        raise ActiveRecord::RecordNotFound, "no console user for email #{email.inspect}" unless user
+
+        response.headers["Cache-Control"] = "no-store"
+        render json: { data: {
+          user_id: user.oid,
+          principal_foreign_id: user.personal_principal_foreign_id,
+          has_provider_key: user.provider_key?
+        } }
+      end
+
       private
 
       def record_payload(principal)

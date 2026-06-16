@@ -1,0 +1,53 @@
+<% content_for :title, "My provider keys · Centaur Console" %>
+
+<div class="mb-8">
+  <h1 class="page-title">My provider keys</h1>
+  <p class="mt-2 max-w-2xl text-sm text-zinc-400">
+    Register your own Anthropic / OpenAI API key. Your Slack threads and connected
+    apps run the agent under <em>your</em> key, billed to you. Keys are stored
+    encrypted and write-only &mdash; they are never shown again after you save them.
+  </p>
+</div>
+
+<div class="space-y-6">
+  <% @providers.each do |provider| %>
+    <% configured = @secrets[provider].present? %>
+    <section class="form-section">
+      <div class="mb-4 flex flex-wrap items-center gap-3">
+        <h2 class="form-section-heading mb-0"><%= provider[:label] %></h2>
+        <% if configured %>
+          <span class="inline-flex items-center rounded px-2 py-0.5 text-xs ring-1 ring-inset bg-emerald-500/10 text-emerald-300 ring-emerald-500/25">configured</span>
+        <% else %>
+          <span class="inline-flex items-center rounded px-2 py-0.5 text-xs ring-1 ring-inset bg-amber-500/10 text-amber-300 ring-amber-500/25">not set</span>
+        <% end %>
+      </div>
+
+      <p class="form-hint mb-4">
+        Swapped in for <code class="text-zinc-300"><%= provider[:env] %></code>
+        on <code class="text-zinc-300"><%= provider[:host] %></code>.
+      </p>
+
+      <%= form_with url: console_provider_key_path(provider[:slug]), method: :patch, data: { turbo: false } do %>
+        <div class="flex flex-wrap items-end gap-3">
+          <div class="grow">
+            <label class="form-label" for="key_<%= provider[:slug] %>"><%= provider[:label] %> API key</label>
+            <%= password_field_tag :key, nil, id: "key_#{provider[:slug]}", class: "form-input",
+                  autocomplete: "off", placeholder: configured ? "•••••••• (unchanged)" : "sk-…" %>
+            <p class="form-hint">
+              Stored encrypted.<%= " Leave blank to keep the current key." if configured %>
+            </p>
+          </div>
+          <%= submit_tag(configured ? "Replace key" : "Save key", class: "btn-primary") %>
+        </div>
+      <% end %>
+
+      <% if configured %>
+        <div class="mt-3">
+          <%= button_to "Remove key", console_provider_key_path(provider[:slug]), method: :delete,
+                form: { data: { turbo: false } },
+                class: "cursor-pointer rounded border border-ink-600 px-3 py-1.5 text-sm text-zinc-400 transition-colors hover:border-red-500/40 hover:text-red-300" %>
+        </div>
+      <% end %>
+    </section>
+  <% end %>
+</div>

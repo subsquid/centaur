@@ -52,6 +52,15 @@ Rails.application.routes.draw do
   end
   get "console/oauth_apps/:id", to: "console#oauth_app", as: :console_oauth_app
 
+  # Self-service "my provider keys": a logged-in user registers their own
+  # Anthropic/OpenAI API key, granted to their personal principal. One page;
+  # per-provider update/destroy keyed by the provider slug.
+  namespace :console do
+    get "provider_keys", to: "provider_keys#show", as: :provider_keys
+    patch "provider_keys/:provider", to: "provider_keys#update", as: :provider_key
+    delete "provider_keys/:provider", to: "provider_keys#destroy"
+  end
+
   # Operator (console user) management. Admin-only; pending users are approved here.
   namespace :console do
     resources :users, only: %i[index] do
@@ -94,6 +103,8 @@ Rails.application.routes.draw do
       end
       resources :principals, only: %i[index show create update] do
         collection do
+          # Map a Slack owner (by verified email) to their personal principal.
+          get "resolve_slack", action: :resolve_slack, as: :resolve_slack
           get "lookup/:namespace/:foreign_id", action: :lookup, as: :lookup
           get "lookup/:namespace/:foreign_id/effective_config",
               action: :effective_config, as: :lookup_effective_config
