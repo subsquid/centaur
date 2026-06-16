@@ -12,7 +12,9 @@ import { createEmulator, type Emulator } from 'emulate'
 import { createMemoryState } from '@chat-adapter/state-memory'
 import type { ServerNotification } from '@centaur/harness-events'
 import {
+  claimThreadOwner,
   createSlackbotV2,
+  recoveryOwnerPrincipalForeignId,
   type SlackbotV2,
   type SlackbotV2AppendMessagesRequest,
   type SlackbotV2ApiMessage,
@@ -21,6 +23,11 @@ import {
   type SlackbotV2SessionMessage
 } from '../src/index'
 import { clearRequesterIdentityCacheForTests } from '../src/session-api'
+import type {
+  SlackbotV2RenderObligation,
+  SlackbotV2ThreadOwner,
+  SlackbotV2ThreadState
+} from '../src/types'
 
 const BOT_TOKEN = 'xoxb-slackbotv2-emulate'
 const USER_TOKEN = 'xoxp-slackbotv2-user'
@@ -460,7 +467,7 @@ describe('slackbotv2', () => {
     }
   })
 
-  it('uses the reply mention requester identity instead of the root requester', async () => {
+  it('ignores a non-owner reply mention (ownership gate)', async () => {
     slackApi.setUserProfile(USER_ID, {
       name: 'alice',
       real_name: 'Alice Requester',
@@ -529,26 +536,98 @@ describe('slackbotv2', () => {
     expect(replyResponse.status).toBe(200)
     await Promise.all(replyWaits)
 
-    expect(codexApi.executes).toHaveLength(2)
+    // Ownership gate: USER_ID claimed the thread as its first author, so the bot
+    // acts only on their messages. USER_B_ID's reply mention is a non-owner and
+    // is ignored entirely -- no second execution, and none of B's identity leaks
+    // into the owner's run.
+    expect(codexApi.executes).toHaveLength(1)
     const rootInput = JSON.parse(codexApi.executes[0]!.body.input_lines.at(-1)!) as {
       message: { content: Array<{ text?: string; type: string }> }
     }
-    const replyInput = JSON.parse(codexApi.executes[1]!.body.input_lines.at(-1)!) as {
-      message: { content: Array<{ text?: string; type: string }> }
-    }
     const rootContext = rootInput.message.content[0]?.text ?? ''
-    const replyContext = replyInput.message.content[0]?.text ?? ''
-
     expect(rootContext).toContain(`Slack user ID: ${USER_ID}`)
     expect(rootContext).toContain('GitHub handle from Slack profile: @alice-gh')
-    expect(replyContext).toContain(`Slack user ID: ${USER_B_ID}`)
-    expect(replyContext).toContain('Slack username: bob')
-    expect(replyContext).toContain('GitHub handle from Slack profile: @bob-gh')
-    expect(replyContext).toContain('Prompted by: @bob-gh')
-    expect(replyContext).not.toContain('@alice-gh')
+    expect(rootContext).not.toContain(USER_B_ID)
+    expect(rootContext).not.toContain('@bob-gh')
   })
 
-  it('includes reply mention requester identity when steering an active execution', async () => {
+  it('claims a single owner when two first messages race for a new thread', async () => {
+    // Handlers are NOT serialized per thread (onLockConflict:'force'), so two
+    // distinct first authors can hit a brand-new thread concurrently. The
+    // atomic insert-if-absent claim (not a setState merge) must let exactly one
+    // win; the loser is gated out -- one execution, one stable owner.
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({ state: sharedState })
+
+    const parent = await postUserMessage('Context for the ownership race.')
+    const aMention = await postUserMessage(`<@${BOT_USER_ID}> A starts the thread`, parent.ts)
+    const bMention = await postUserMessage(`<@${BOT_USER_ID}> B starts the thread`, parent.ts, slackB)
+
+    const aWaits: Promise<unknown>[] = []
+    const bWaits: Promise<unknown>[] = []
+    // Fire both without awaiting the first: mirror real concurrency as closely
+    // as the harness allows.
+    const aPromise = bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-owner-race-a',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: aMention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> A starts the thread`
+        }
+      }),
+      {},
+      waitUntilContext(aWaits)
+    )
+    const bPromise = bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-owner-race-b',
+        event: {
+          type: 'app_mention',
+          user: USER_B_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: bMention.ts,
+          thread_ts: parent.ts,
+          text: `<@${BOT_USER_ID}> B starts the thread`
+        }
+      }),
+      {},
+      waitUntilContext(bWaits)
+    )
+    const [aResponse, bResponse] = await Promise.all([aPromise, bPromise])
+    expect(aResponse.status).toBe(200)
+    expect(bResponse.status).toBe(200)
+    await Promise.all([...aWaits, ...bWaits])
+
+    // Exactly one owner ran; the loser was ignored (no second execution).
+    expect(codexApi.executes).toHaveLength(1)
+
+    const key = threadKey(parent.ts)
+    const claim = await sharedState.get<{ slackUserId: string }>(`slackbotv2:owner:claim:${key}`)
+    const persisted = await sharedState.get<{ owner?: { slackUserId: string } }>(
+      `thread-state:${key}`
+    )
+    // The claim key is the source of truth; state.owner mirrors it.
+    expect(claim?.slackUserId).toBeDefined()
+    const ownerId = claim!.slackUserId
+    expect([USER_ID, USER_B_ID]).toContain(ownerId)
+    expect(persisted?.owner?.slackUserId).toBe(ownerId)
+
+    // The single execution belongs to whoever won the claim, and only the
+    // winner's idempotency key reached the session.
+    const winnerTs = ownerId === USER_ID ? aMention.ts : bMention.ts
+    expect(codexApi.executes[0]!.body.idempotency_key).toBe(winnerTs)
+  })
+
+  it('ignores a non-owner steering reply during an active execution', async () => {
     codexApi.autoRespond = false
     slackApi.setUserProfile(USER_ID, {
       name: 'alice',
@@ -620,17 +699,17 @@ describe('slackbotv2', () => {
     expect(replyResponse.status).toBe(200)
     await Promise.all(replyWaits)
 
+    // Ownership gate: USER_B_ID is not the owner, so their steering reply is
+    // ignored mid-run -- it neither starts a new execution nor appends to the
+    // active one, and none of B's identity reaches the session.
     expect(codexApi.executes).toHaveLength(1)
-    expect(codexApi.appends).toHaveLength(2)
-    const steeredParts = codexApi.appends[1]!.body.messages[0]!.parts
-    const steeredText = steeredParts
+    const allAppendText = codexApi.appends
+      .flatMap(append => append.body.messages)
+      .flatMap(message => message.parts)
       .map(part => (isRecord(part) && typeof part.text === 'string' ? part.text : ''))
       .join('\n')
-    expect(steeredText).toContain('# Requester Context')
-    expect(steeredText).toContain(`Slack user ID: ${USER_B_ID}`)
-    expect(steeredText).toContain('GitHub handle from Slack profile: @bob-gh')
-    expect(steeredText).toContain('Prompted by: @bob-gh')
-    expect(steeredText).not.toContain('@alice-gh')
+    expect(allAppendText).not.toContain(`Slack user ID: ${USER_B_ID}`)
+    expect(allAppendText).not.toContain('@bob-gh')
 
     codexApi.closeStreams()
     await Promise.all(rootWaits)
@@ -2270,6 +2349,63 @@ describe('slackbotv2', () => {
     expect(Number(recoveredThreadState?.lastEventId)).toBeGreaterThan(0)
   })
 
+  it('re-resolves the persisted owner principal into the replayed forward on recovery', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+
+    const parent = await postUserMessage('Context before owner-principal recovery.')
+    const mentionText = `<@${BOT_USER_ID}> recover under the owner principal`
+    const mention = await postUserMessage(mentionText, parent.ts)
+    const key = threadKey(parent.ts)
+    const message = apiMessageFromSlackEvent({
+      isMention: true,
+      text: mentionText,
+      threadId: key,
+      ts: mention.ts
+    })
+    // Persisted owner + an obligation carrying the owner principal (Part 3f).
+    // The recovery sweep must re-resolve that principal into the replayed
+    // forward instead of letting api-rs fall back to its channel-derived one.
+    await sharedState.set(`thread-state:${key}`, {
+      activeExecution: true,
+      executedMessageIds: [mention.ts],
+      forwardedMessageIds: [mention.ts],
+      historyForwarded: true,
+      lastEventId: 0,
+      owner: { slackUserId: USER_ID, teamId: TEAM_ID, principalForeignId: 'user-77' },
+      renderObligation: {
+        afterEventId: 0,
+        executionId: 'exe-owner-recovery',
+        message,
+        principalForeignId: 'user-77'
+      }
+    } satisfies SlackbotV2ThreadState)
+    await sharedState.appendToList('slackbotv2:render:index', key)
+    codexApi.emitOutputLines(key, sampleCodexOutputLines('Recovered under owner principal.'))
+
+    // The forward input the sweep builds carries the persisted owner principal.
+    const persisted = await sharedState.get<SlackbotV2ThreadState>(`thread-state:${key}`)
+    expect(recoveryOwnerPrincipalForeignId(persisted!.renderObligation!, persisted!)).toBe('user-77')
+
+    bot = createTestBot({ state: sharedState })
+
+    await waitFor(() => codexApi.eventRequests.length === 1, 2000)
+    await waitFor(() => slackApi.calls.some(call => call.method === 'chat.stopStream'), 2000)
+
+    expect(codexApi.eventRequests).toEqual([
+      { afterEventId: 0, executionId: 'exe-owner-recovery', threadKey: key }
+    ])
+    expect(await threadText(parent.ts)).toContain('Recovered under owner principal.')
+    const recovered = await sharedState.get<SlackbotV2ThreadState>(`thread-state:${key}`)
+    expect(recovered).toEqual(
+      expect.objectContaining({ activeExecution: false, renderObligation: null })
+    )
+    // Ownership (with its principal) survives the recovery sweep -- immutable.
+    expect(recovered?.owner).toEqual(
+      expect.objectContaining({ slackUserId: USER_ID, principalForeignId: 'user-77' })
+    )
+  })
+
   it('does not let one hung recovery block the obligations queued behind it', async () => {
     const sharedState = createMemoryState()
     await sharedState.connect()
@@ -2755,6 +2891,70 @@ describe('slackbotv2', () => {
     await Promise.all(allowedBotWaits)
     expect(codexApi.appends).toHaveLength(1)
     expect(codexApi.executes).toHaveLength(1)
+  })
+})
+
+describe('claimThreadOwner', () => {
+  it('lets exactly one of many concurrent first authors win the claim', async () => {
+    const state = createMemoryState()
+    await state.connect()
+    const threadId = 'slack:C:claim-race'
+    const claimants: SlackbotV2ThreadOwner[] = Array.from({ length: 8 }, (_, index) => ({
+      slackUserId: `U${index}`,
+      teamId: 'T'
+    }))
+    // Fire all claims concurrently against the shared atomic key. The
+    // insert-if-absent semantics must collapse them to a single owner that
+    // every caller agrees on (the winner sees its own claimant; the losers read
+    // back the winner's), and never undefined (fail closed).
+    const resolved = await Promise.all(
+      claimants.map(claimant => claimThreadOwner(state, threadId, claimant))
+    )
+    const winners = new Set(resolved.map(owner => owner?.slackUserId))
+    expect(winners.size).toBe(1)
+    expect([...winners][0]).toBeDefined()
+    // The persisted claim key matches the single winner.
+    const stored = await state.get<SlackbotV2ThreadOwner>(`slackbotv2:owner:claim:${threadId}`)
+    expect(stored?.slackUserId).toBe([...winners][0])
+  })
+
+  it('is immutable: a later author reads back the original owner, not itself', async () => {
+    const state = createMemoryState()
+    await state.connect()
+    const threadId = 'slack:C:claim-immutable'
+    const first = await claimThreadOwner(state, threadId, { slackUserId: 'U1', teamId: 'T' })
+    const second = await claimThreadOwner(state, threadId, { slackUserId: 'U2', teamId: 'T' })
+    expect(first?.slackUserId).toBe('U1')
+    expect(second?.slackUserId).toBe('U1')
+  })
+})
+
+describe('recoveryOwnerPrincipalForeignId', () => {
+  const obligation = (principalForeignId?: string): SlackbotV2RenderObligation => ({
+    afterEventId: 0,
+    executionId: 'exe-1',
+    message: apiMessageFromSlackEvent({
+      isMention: true,
+      text: 'x',
+      threadId: threadKey('1.1'),
+      ts: '1.1'
+    }),
+    ...(principalForeignId ? { principalForeignId } : {})
+  })
+
+  it('prefers the obligation-stored owner principal', () => {
+    const state: SlackbotV2ThreadState = { owner: { slackUserId: 'U1', principalForeignId: 'live' } }
+    expect(recoveryOwnerPrincipalForeignId(obligation('stored'), state)).toBe('stored')
+  })
+
+  it('falls back to the live thread owner principal when the obligation has none', () => {
+    const state: SlackbotV2ThreadState = { owner: { slackUserId: 'U1', principalForeignId: 'live' } }
+    expect(recoveryOwnerPrincipalForeignId(obligation(), state)).toBe('live')
+  })
+
+  it('is undefined when neither the obligation nor the owner carries a principal', () => {
+    expect(recoveryOwnerPrincipalForeignId(obligation(), { owner: { slackUserId: 'U1' } })).toBeUndefined()
+    expect(recoveryOwnerPrincipalForeignId(obligation(), null)).toBeUndefined()
   })
 })
 

@@ -30,6 +30,7 @@ import {
   sessionStreamError
 } from './session-api'
 import { extractMessageOverrides } from './overrides'
+import { isOwnerPrincipalConfigured, resolveOwnerPrincipal } from './owner-principal'
 import { isAllowedSlackMessage, isAllowedSlackWebhookBody } from './slack-events'
 import type {
   ForwardSessionInput,
@@ -40,10 +41,11 @@ import type {
   SlackbotV2Options,
   SlackbotV2RenderObligation,
   SlackbotV2RendererSource,
+  SlackbotV2ThreadOwner,
   SlackbotV2ThreadState,
   SlackbotV2Trace
 } from './types'
-import { elapsedMs, errorMessage, noopLogger, nowMs, traceLog } from './utils'
+import { elapsedMs, errorMessage, noopLogger, nowMs, stringValue, traceLog } from './utils'
 
 export type {
   SlackbotV2,
@@ -288,6 +290,71 @@ async function syncThreadMessageToSession(
     attachment_count: serializedMessage.attachments.length,
     phase_ms: elapsedMs(serializeStartedAtMs)
   })
+
+  // --- Thread ownership ----------------------------------------------------
+  // The first author claims the thread; the bot acts ONLY on the owner's
+  // messages (non-owners are ignored — no execute, no append). Ownership is
+  // immutable (no transfer/fork). Claimed here, after thread state loads,
+  // because the synchronous isAllowedSlackMessage gate runs before state exists.
+  const authorOwner = ownerIdentityFromMessage(serializedMessage)
+  let owner = state.owner
+  if (!owner) {
+    // No owner yet. Claim atomically against the dedicated claim key
+    // (insert-if-absent): concurrent first messages are NOT serialized
+    // (onLockConflict:'force'), so a setState merge would let both win. The
+    // claim key is the source of truth; state.owner is its mirror.
+    if (!authorOwner) {
+      // First message with an unresolvable author: never run un-owned, or a
+      // later (possibly different) user could claim the thread out from under
+      // the real first author. Skip until an authored message arrives.
+      traceLog(input.options, 'slackbotv2_owner_claim_unresolvable_author', trace, {
+        message_id: serializedMessage.id
+      })
+      return
+    }
+    owner = await claimThreadOwner(input.state, thread.id, authorOwner)
+    if (!owner) {
+      traceLog(input.options, 'slackbotv2_owner_claim_unresolved', trace, {
+        author_user_id: authorOwner.slackUserId
+      })
+      return
+    }
+    if (!state.owner) await thread.setState({ owner })
+  }
+  if (!authorOwner || authorOwner.slackUserId !== owner.slackUserId) {
+    traceLog(input.options, 'slackbotv2_owner_gate_ignored', trace, {
+      author_user_id: authorOwner?.slackUserId,
+      owner_user_id: owner.slackUserId
+    })
+    return
+  }
+
+  // Resolve the owner's personal principal so api-rs runs the session under the
+  // owner's provider key. The principal is bound ONCE at first session create
+  // (Part 2 immutability), and createSession runs even for a non-mention append,
+  // so this must ride EVERY forward — not just executes — or the thread binds to
+  // the channel-derived principal and can never rebind to the owner.
+  let principalForeignId: string | undefined
+  if (isOwnerPrincipalConfigured(input.options)) {
+    const resolved = await resolveOwnerPrincipal(input.options, owner)
+    if (!resolved || !resolved.hasProviderKey) {
+      // Fail closed: never fall back to a shared key. Prompt onboarding on an
+      // execute trigger; silently skip a non-mention append (no prompt spam).
+      traceLog(input.options, 'slackbotv2_owner_no_provider_key', trace, {
+        has_provider_key: resolved?.hasProviderKey === true,
+        owner_user_id: owner.slackUserId,
+        resolved: Boolean(resolved)
+      })
+      if (shouldStartExecution) await postOwnerOnboardingPrompt(thread, owner, input.options)
+      return
+    }
+    principalForeignId = resolved.principalForeignId
+    if (owner.principalForeignId !== principalForeignId) {
+      owner = { ...owner, principalForeignId }
+      await thread.setState({ owner })
+    }
+  }
+
   let context: SlackbotV2ApiMessage[] | undefined
 
   if (shouldIncludeContext) {
@@ -327,6 +394,8 @@ async function syncThreadMessageToSession(
       lastEventId = Math.max(lastEventId, eventId)
     },
     openStream: false,
+    ownerSlackUserId: owner.slackUserId,
+    principalForeignId,
     threadId: thread.id,
     trace
   }
@@ -370,7 +439,10 @@ async function syncThreadMessageToSession(
       renderObligation: {
         afterEventId: lastEventId,
         executionId: execution.execution_id,
-        message: serializedMessage
+        message: serializedMessage,
+        // Persist the owner principal so the recovery sweep re-forwards under it
+        // (Part 3d/3f) without a fresh Slack-profile + console round-trip.
+        principalForeignId
       }
     })
     await indexRenderObligation(input.state, {
@@ -790,7 +862,7 @@ async function recoverRenderObligations(
       // Race a deadline; on timeout move on and leave the attempt running
       // detached - it may still finish and clear the obligation, which is why
       // the lease is kept so a later pass does not start a duplicate render.
-      const recovery = recoverRenderObligation(chat, state, options, threadId, obligation)
+      const recovery = recoverRenderObligation(chat, state, options, threadId, obligation, threadState)
       let outcome: { timedOut: true } | { timedOut: false; deferred: boolean }
       try {
         outcome = await Promise.race([
@@ -839,7 +911,8 @@ async function recoverRenderObligation(
   state: StateAdapter,
   options: SlackbotV2Options,
   threadId: string,
-  obligation: SlackbotV2RenderObligation
+  obligation: SlackbotV2RenderObligation,
+  threadState: SlackbotV2ThreadState | null
 ): Promise<boolean> {
   const trace: SlackbotV2Trace = {
     includeContext: false,
@@ -850,6 +923,10 @@ async function recoverRenderObligation(
     threadId
   }
   const thread = chat.thread(threadId)
+  // Re-resolve the owner principal from persisted state so a replayed forward
+  // binds/runs under the owner (Part 3d/3f), not api-rs's channel-derived
+  // fallback. No fresh Slack-profile/console round-trip on recovery.
+  const principalForeignId = recoveryOwnerPrincipalForeignId(obligation, threadState)
   // Replay from the obligation's starting position, not the thread's
   // lastEventId: the failed render may have consumed events (including the
   // terminal result) past which a resumed stream would never see the final
@@ -863,6 +940,8 @@ async function recoverRenderObligation(
       lastEventId = Math.max(lastEventId, eventId)
     },
     openStream: false,
+    ownerSlackUserId: threadState?.owner?.slackUserId,
+    principalForeignId,
     threadId,
     trace
   }
@@ -969,6 +1048,43 @@ async function* streamOpenedSession(
 
 function renderRecoveryLeaseKey(threadId: string): string {
   return `slackbotv2:render:lease:${threadId}`
+}
+
+function ownerClaimKey(threadId: string): string {
+  return `slackbotv2:owner:claim:${threadId}`
+}
+
+/**
+ * Claim thread ownership for the first author atomically. Handlers are NOT
+ * serialized per thread (onLockConflict:'force'), so two concurrent first
+ * messages race here; setIfNotExists (an INSERT ... ON CONFLICT DO NOTHING)
+ * lets exactly one win. The winner is the owner; a loser loads the winning
+ * claimant from the same key. No TTL — ownership is immutable, so the claim
+ * persists for the thread's life (mirrored onto state.owner, which the gate
+ * reads). Returns the resolved owner, or undefined if the claim could neither
+ * be written nor read back (treat as un-owned: fail closed). Exported for tests.
+ */
+export async function claimThreadOwner(
+  state: StateAdapter,
+  threadId: string,
+  authorOwner: SlackbotV2ThreadOwner
+): Promise<SlackbotV2ThreadOwner | undefined> {
+  const won = await state.setIfNotExists(ownerClaimKey(threadId), authorOwner)
+  if (won) return authorOwner
+  return (await state.get<SlackbotV2ThreadOwner>(ownerClaimKey(threadId))) ?? undefined
+}
+
+/**
+ * The owner principal the recovery sweep re-forwards under: the obligation's
+ * self-sufficient copy first, then the live thread owner (Part 3d/3f). Exported
+ * for tests. Returns undefined when neither is set (api-rs falls back to its
+ * channel-derived principal).
+ */
+export function recoveryOwnerPrincipalForeignId(
+  obligation: SlackbotV2RenderObligation,
+  threadState: SlackbotV2ThreadState | null
+): string | undefined {
+  return obligation.principalForeignId ?? threadState?.owner?.principalForeignId
 }
 
 /**
@@ -1293,6 +1409,38 @@ function shouldAwaitSlackHandoff(rawBody: string): boolean {
   } catch {
     return false
   }
+}
+
+/** The thread-owner identity for a message: its Slack author + team, or undefined. */
+function ownerIdentityFromMessage(message: SlackbotV2ApiMessage): SlackbotV2ThreadOwner | undefined {
+  const slackUserId = stringValue(message.author.userId)
+  if (!slackUserId) return undefined
+  const teamId = stringValue(message.teamId)
+  return teamId ? { slackUserId, teamId } : { slackUserId }
+}
+
+/**
+ * Tell the owner to register a provider key, when their owner-triggered run was
+ * skipped for lack of one. The run is already failed closed (never under a shared
+ * key); this is the user-facing nudge.
+ *
+ * TODO(multitenant): post this as an ephemeral Slack reply to the owner once the
+ * chat adapter's post API is wired in; for now it logs so the skip is observable.
+ */
+async function postOwnerOnboardingPrompt(
+  thread: Thread<SlackbotV2ThreadState>,
+  owner: SlackbotV2ThreadOwner,
+  options: SlackbotV2Options
+): Promise<void> {
+  const logger = options.logger ?? noopLogger
+  const link = options.consoleUrl
+    ? `${options.consoleUrl.replace(/\/+$/, '')}/console/provider_keys`
+    : 'the Centaur console'
+  logger.warn('slackbotv2_owner_onboarding_prompt', {
+    owner_user_id: owner.slackUserId,
+    prompt: `Register your provider API key at ${link} to run the agent under your own key.`,
+    thread_id: thread.id
+  })
 }
 
 function isSlackThreadReply(message: ChatMessage): boolean {

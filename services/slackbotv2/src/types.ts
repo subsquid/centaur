@@ -91,6 +91,10 @@ export type SlackbotV2Options = {
   recoverRenderObligationsOnStart?: boolean
   /** Per-thread deadline for one recovery attempt during the startup scan. */
   renderRecoveryThreadTimeoutMs?: number
+  /** centaur-console base URL, for resolving a thread owner -> their principal. */
+  consoleUrl?: string
+  /** Privileged console ApiKey the bot uses to call the resolve endpoint. */
+  consoleToken?: string
   signingSecret: string
   slackApiUrl?: string
   state?: StateAdapter
@@ -106,12 +110,26 @@ export type SlackbotV2 = {
   chat: Chat
 }
 
+/**
+ * The owner of a Slack thread: the first author, claimed once and immutable (no
+ * transfer/fork). The bot reacts only to the owner's messages, and the thread's
+ * session runs under the owner's provider key. `principalForeignId` caches the
+ * console resolution so the startup recovery sweep can re-bind without a fresh
+ * Slack profile + console round-trip.
+ */
+export type SlackbotV2ThreadOwner = {
+  slackUserId: string
+  teamId?: string
+  principalForeignId?: string
+}
+
 export type SlackbotV2ThreadState = {
   activeExecution?: boolean
   executedMessageIds?: string[]
   forwardedMessageIds?: string[]
   historyForwarded?: boolean
   lastEventId?: number
+  owner?: SlackbotV2ThreadOwner
   renderObligation?: SlackbotV2RenderObligation | null
 }
 
@@ -119,6 +137,13 @@ export type SlackbotV2RenderObligation = {
   afterEventId: number
   executionId: string
   message: SlackbotV2ApiMessage
+  /**
+   * The owner's principal foreign_id at the time the obligation was created, so
+   * the startup recovery sweep re-forwards under the owner principal rather than
+   * api-rs's channel-derived fallback (MULTITENANT Part 3d/3f). Self-sufficient
+   * copy; the sweep falls back to the live `state.owner.principalForeignId`.
+   */
+  principalForeignId?: string
 }
 
 export type SlackbotV2MessageMode = 'append' | 'execute'
@@ -146,6 +171,21 @@ export type ForwardSessionInput = {
   model?: string
   onEventId(eventId: number): void
   openStream: boolean
+  /**
+   * The immutable thread owner's Slack user id, used to label thread context as
+   * owner-vs-untrusted. Anchored to the owner (not the triggering message
+   * author) so an empty author can't mislabel the owner's own messages as
+   * untrusted (MULTITENANT Part 3g). The gate guarantees they match on the live
+   * path; absent on the recovery replay (no fresh context is collected there).
+   */
+  ownerSlackUserId?: string
+  /**
+   * The thread owner's personal principal foreign_id, threaded into the session
+   * create/execute metadata so api-rs runs the session under the owner's
+   * provider key (MULTITENANT Part 2/3). Absent when per-owner resolution is not
+   * configured, in which case api-rs falls back to its channel-derived principal.
+   */
+  principalForeignId?: string
   threadId: string
   trace?: SlackbotV2Trace
 }
