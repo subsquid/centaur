@@ -8,7 +8,7 @@
 use crate::IronControlClient;
 use crate::error::Result;
 use crate::models::Principal;
-use crate::principal::derive_principal;
+use crate::principal::{PrincipalRef, derive_principal};
 
 /// Registers a session's principal against iron-control at session start.
 ///
@@ -36,23 +36,43 @@ impl SessionRegistrar {
         }
     }
 
-    /// Upsert the principal for ``thread_key`` and assign it the configured
-    /// roles. ``slack_user_id`` keys a 1:1 DM principal; it is ignored for
-    /// channel threads. Returns the upserted principal record (its ``id`` is
-    /// the OID) so callers can bind the session's egress proxy to the same
-    /// identity. Idempotent.
+    /// Upsert the thread-derived principal and grant it the configured infra
+    /// role. ``slack_user_id`` keys a 1:1 DM principal; it is ignored for channel
+    /// threads. The legacy path for threads with no explicit owner. Returns the
+    /// upserted record (its ``id`` is the OID) so callers can bind the session's
+    /// egress proxy to the same identity. Idempotent.
     pub async fn register_session(
         &self,
         thread_key: &str,
         slack_user_id: Option<&str>,
     ) -> Result<Principal> {
-        let principal = derive_principal(thread_key, slack_user_id);
+        self.register_principal(&derive_principal(thread_key, slack_user_id), true)
+            .await
+    }
+
+    /// Upsert ``principal`` and, when ``assign_roles`` is set, grant it the
+    /// configured infra role.
+    ///
+    /// The owner (explicit-principal) path passes ``assign_roles: false`` so a
+    /// session-scoped principal stays **provider-key-only**: it resolves the
+    /// owner's provider key and nothing else, capping the blast radius of
+    /// untrusted thread context to "spend the owner's LLM key" (MULTITENANT
+    /// Part 1a/2c). The harness still gets its placeholder env from the proxy
+    /// fragments regardless of role, so the LLM call works under the owner's key.
+    /// Idempotent.
+    pub async fn register_principal(
+        &self,
+        principal: &PrincipalRef,
+        assign_roles: bool,
+    ) -> Result<Principal> {
         let record = self
             .client
             .upsert_principal(&principal.to_identity_input(&self.namespace))
             .await?;
-        for role_id in &self.assign_role_ids {
-            self.client.assign_role(&record.id, role_id).await?;
+        if assign_roles {
+            for role_id in &self.assign_role_ids {
+                self.client.assign_role(&record.id, role_id).await?;
+            }
         }
         Ok(record)
     }
