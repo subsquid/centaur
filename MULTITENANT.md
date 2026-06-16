@@ -7,6 +7,13 @@
 > **owner** the bot answers to. The domain-`Account` / cross-service-JWT machinery is not built.
 > See "What changed and why" at the bottom for the rationale and the discarded pieces.
 
+> **Scope note (this PR).** **Part 5 (third-party app onboarding — console as OAuth provider +
+> api-rs per-user token verification) is split into a separate PR** and is **not** in this branch.
+> This PR ships **Parts 1–4** only: per-user provider keys + `resolve_slack` (console), running
+> sessions as the thread owner's principal (api-rs), and thread ownership/gate/owner-principal
+> (slackbotv2) — i.e. the **Slack path**. The Part 5 work is preserved on branch
+> `feat/oauth-provider`. The Part 5 sections below are retained as the design for that follow-up PR.
+
 ## Context
 
 `centaur` is a monorepo of three cooperating services:
