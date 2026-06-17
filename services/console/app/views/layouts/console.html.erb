@@ -35,7 +35,7 @@
             </a>
             <div class="flex items-center gap-4 text-sm">
               <nav class="flex items-center gap-1">
-                <% nav = [["principals", console_principals_path], ["secrets", console_secrets_path], ["credentials", console_credentials_path], ["oauth apps", console_oauth_apps_path]] %>
+                <% nav = [["principals", console_principals_path], ["secrets", console_secrets_path], ["credentials", console_credentials_path], ["oauth apps", console_oauth_apps_path], ["my keys", console_provider_keys_path]] %>
                 <% nav << ["users", console_users_path] if current_user&.admin? %>
                 <% nav.each do |name, path| %>
                   <% active = request.path == path || (name == "principals" && request.path.start_with?("/console/principals")) %>

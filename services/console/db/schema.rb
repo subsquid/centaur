@@ -237,6 +237,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_06_16_170000) do
     t.jsonb "labels", default: {}, null: false
     t.string "name"
     t.string "namespace", default: "default", null: false
+    t.boolean "session_scoped", default: false, null: false
     t.bigint "sync_config_cache_version", default: 0, null: false
     t.datetime "updated_at", null: false
     t.index ["created_by_id"], name: "index_principals_on_created_by_id"

@@ -27,6 +27,12 @@ pub enum IronControlError {
         #[source]
         source: reqwest::Error,
     },
+    /// A caller supplied an explicit principal foreign_id that isn't a valid
+    /// URL-safe slug, so it can't be registered. Rejected rather than silently
+    /// falling back to a thread-derived principal (which would run the session
+    /// under the wrong identity / key).
+    #[error("invalid principal foreign_id {foreign_id:?}: must be URL-safe (A-Za-z0-9-._~)")]
+    InvalidPrincipalForeignId { foreign_id: String },
 }
 
 pub type Result<T> = std::result::Result<T, IronControlError>;

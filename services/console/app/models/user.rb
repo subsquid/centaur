@@ -28,6 +28,54 @@ class User < ApplicationRecord
     update!(status: :active, approved_at: Time.current, approved_by: by)
   end
 
+  # The namespace a user's personal principal lives in. Must match api-rs's
+  # IRON_CONTROL_NAMESPACE (default "default"): slackbotv2/third-party callers
+  # send only the foreign_id, and api-rs upserts/resolves the principal in its
+  # own namespace, so the grant-bearing principal console creates here has to
+  # share that namespace or the grant never binds.
+  PERSONAL_PRINCIPAL_NAMESPACE = "default".freeze
+
+  # The stable foreign_id of this user's personal principal. Derived from the
+  # primary key (not #oid, which is a *computed* opaque id), so it is durable
+  # across oid-encoding changes and never collides with another user's.
+  def personal_principal_foreign_id
+    "user-#{id}"
+  end
+
+  # Find-or-create this user's session-scoped personal principal: the
+  # provider-key-only identity their Slack/third-party sessions run as. Idempotent.
+  # Also (re)asserts session_scoped in case the row was first created by api-rs's
+  # principal upsert (which doesn't set the flag) before the user registered a key.
+  def personal_principal
+    principal = Principal.find_or_create_by!(
+      namespace: PERSONAL_PRINCIPAL_NAMESPACE,
+      foreign_id: personal_principal_foreign_id
+    ) do |p|
+      p.created_by = self
+      p.session_scoped = true
+      p.name = "Personal principal (#{email})"
+    end
+    principal.update!(session_scoped: true) unless principal.session_scoped?
+    principal
+  end
+
+  # This user's personal principal if it already exists, without creating one.
+  # Used by the read-only resolve endpoint so a GET never writes.
+  def existing_personal_principal
+    Principal.find_by(namespace: PERSONAL_PRINCIPAL_NAMESPACE, foreign_id: personal_principal_foreign_id)
+  end
+
+  # Whether the user has registered at least one provider API key (a provider-key
+  # static secret granted to their personal principal). Drives the bot's
+  # run-vs-prompt-onboarding decision. Requires a deliverable source: a granted
+  # secret with no (or a non-deliverable) source delivers no value to the proxy
+  # (Principal#sync_secrets skips it), so it must not count as a registered key.
+  def provider_key?
+    principal = existing_personal_principal
+    return false unless principal
+    principal.granted_static_secrets.any? { |s| s.provider_key? && s.source&.deliverable? }
+  end
+
   # Resolves the console user behind a verified SSO identity, creating or linking
   # as needed, and (re)caches the identity's email/name. A returning login matches
   # by the stable (provider, subject). A new identity links to an existing user

@@ -117,4 +117,38 @@ class GrantTest < ActiveSupport::TestCase
     grant.update!(priority: 250)
     assert_equal 250, grant.reload.priority
   end
+
+  # --- session-scoped principal invariant (provider-key-only) ----------------
+
+  def provider_key_secret
+    StaticSecret.create!(namespace: "default", foreign_id: "pk-anthropic",
+                         replace_config: { "proxy_value" => "ANTHROPIC_API_KEY", "match_headers" => %w[X-Api-Key] },
+                         created_by: users(:member_user))
+  end
+
+  test "a session-scoped principal accepts a provider-key static secret" do
+    grant = Grant.new(principal: users(:member_user).personal_principal,
+                      static_secret: provider_key_secret, created_by: users(:member_user))
+    assert grant.valid?
+  end
+
+  test "a session-scoped principal rejects a non-provider-key static secret" do
+    grant = Grant.new(principal: users(:member_user).personal_principal,
+                      static_secret: static_secrets(:github_token_inject), created_by: users(:member_user))
+    assert_not grant.valid?
+    assert_includes grant.errors[:base], "a session-scoped principal may only be granted provider-key secrets"
+  end
+
+  test "a session-scoped principal rejects a non-static grantable" do
+    grant = Grant.new(principal: users(:member_user).personal_principal,
+                      pg_dsn_secret: pg_dsn_secrets(:acme_analytics_pg), created_by: users(:member_user))
+    assert_not grant.valid?
+    assert_includes grant.errors[:base], "a session-scoped principal may only be granted provider-key secrets"
+  end
+
+  test "an ordinary principal is unaffected by the provider-key invariant" do
+    # acme_channel is not session-scoped, so any grantable is allowed.
+    assert Grant.new(valid_attrs(principal: principals(:acme_channel),
+                                 static_secret: static_secrets(:db_password_replace))).valid?
+  end
 end

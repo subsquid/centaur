@@ -133,6 +133,103 @@ pub fn derive_principal(
     }
 }
 
+/// Whether a string is a valid iron-control ``foreign_id``: a non-empty run of
+/// URL-safe characters (``A-Za-z0-9-._~``), matching the format iron-control
+/// (centaur-console) enforces. The console personal principal (``user-{id}``)
+/// and the Part 5 token ``sub`` are already in this shape.
+fn is_valid_foreign_id(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~'))
+}
+
+/// Build a principal ref for an explicit, caller-supplied ``foreign_id``: the
+/// thread owner's personal principal (the Slack path) or a third-party token's
+/// ``sub`` (Part 5). Unlike [`derive_principal`] the foreign_id is used verbatim
+/// (never slugged), so the principal matches the exact identity the console
+/// minted the provider-key grant against. Returns ``None`` for a blank/malformed
+/// id so the caller can reject it rather than register a bogus principal.
+pub fn explicit_principal(foreign_id: &str) -> Option<PrincipalRef> {
+    let foreign_id = foreign_id.trim();
+    if !is_valid_foreign_id(foreign_id) {
+        return None;
+    }
+    Some(PrincipalRef {
+        foreign_id: foreign_id.to_owned(),
+        name: format!("Owner principal {foreign_id}"),
+        labels: BTreeMap::new(),
+    })
+}
+
+/// How a session's iron-control principal should be bound on a
+/// ``create_or_get_session`` call. See [`resolve_principal_binding`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PrincipalBinding {
+    /// The session is already bound; keep its existing principal. Ownership is
+    /// immutable — there is no transfer — so a later ``principal_foreign_id`` is
+    /// ignored.
+    AlreadyBound,
+    /// First binding to an explicit owner-supplied principal. Registered WITHOUT
+    /// the shared infra role: a session-scoped principal resolves only the
+    /// owner's provider key, capping the blast radius of untrusted thread
+    /// context to "spend the owner's LLM key".
+    Explicit(PrincipalRef),
+    /// First binding to the thread-derived principal (channel/DM/thread),
+    /// granted the shared infra role — today's behavior for threads with no
+    /// explicit owner.
+    Derived(PrincipalRef),
+}
+
+/// Decide how to bind a session's iron-control principal.
+///
+/// - ``current`` is the principal already persisted on the session (``Some``
+///   once bound). Binding happens **once**, at first creation; an already-bound
+///   session keeps its principal and ignores ``explicit_foreign_id`` (ownership
+///   is immutable — no transfer, no fork).
+/// - Otherwise an explicit (owner) ``foreign_id`` wins over thread derivation. A
+///   present-but-malformed explicit id is **rejected** rather than silently
+///   derived, so a session never runs under the wrong identity by accident.
+/// - With no explicit id, the principal is derived from the thread key as before.
+pub fn resolve_principal_binding(
+    current: Option<&str>,
+    thread_key: &str,
+    slack_user_id: Option<&str>,
+    explicit_foreign_id: Option<&str>,
+    conversation_name: Option<&str>,
+) -> Result<PrincipalBinding, crate::error::IronControlError> {
+    if current.is_some() {
+        return Ok(PrincipalBinding::AlreadyBound);
+    }
+    match explicit_foreign_id {
+        // A present key is a deliberate "run as this principal" instruction.
+        // A blank/whitespace value is malformed input, NOT the same as absence:
+        // silently deriving here would bind the session to the shared channel
+        // principal (which carries the infra role), exactly the cross-tenant
+        // key-sharing this design prevents. Reject it so a misbehaving caller
+        // fails closed rather than running under the wrong identity.
+        Some(raw) => {
+            let foreign_id = raw.trim();
+            if foreign_id.is_empty() {
+                return Err(crate::error::IronControlError::InvalidPrincipalForeignId {
+                    foreign_id: raw.to_owned(),
+                });
+            }
+            explicit_principal(foreign_id)
+                .map(PrincipalBinding::Explicit)
+                .ok_or_else(|| crate::error::IronControlError::InvalidPrincipalForeignId {
+                    foreign_id: foreign_id.to_owned(),
+                })
+        }
+        // Absent: today's fallback — derive the principal from the thread key.
+        None => Ok(PrincipalBinding::Derived(derive_principal(
+            thread_key,
+            slack_user_id,
+            conversation_name,
+        ))),
+    }
+}
+
 /// Identify the team and conversation segments by their Slack prefix, ignoring
 /// the leading source namespace and any numeric ``thread_ts``. Returns the
 /// first team (``T…``) and first conversation (``C``/``D``/``G``) found.
@@ -301,5 +398,85 @@ mod tests {
             input.labels.get("slack_channel_id").map(String::as_str),
             Some("C1")
         );
+    }
+
+    // --- explicit principal + binding selection -----------------------------
+
+    #[test]
+    fn explicit_principal_uses_a_valid_foreign_id_verbatim() {
+        let principal = explicit_principal("user-42").expect("valid foreign_id");
+        assert_eq!(principal.foreign_id, "user-42");
+        assert!(principal.labels.is_empty());
+    }
+
+    #[test]
+    fn explicit_principal_trims_surrounding_whitespace() {
+        assert_eq!(explicit_principal("  user-7  ").unwrap().foreign_id, "user-7");
+    }
+
+    #[test]
+    fn explicit_principal_rejects_blank_and_malformed_ids() {
+        assert!(explicit_principal("").is_none());
+        assert!(explicit_principal("   ").is_none());
+        assert!(explicit_principal("user 42").is_none()); // space
+        assert!(explicit_principal("user/42").is_none()); // slash
+        assert!(explicit_principal("user:42").is_none()); // colon
+    }
+
+    #[test]
+    fn binding_keeps_an_already_bound_principal() {
+        // Immutability: a later explicit principal_foreign_id is ignored once bound.
+        let binding =
+            resolve_principal_binding(Some("prn_existing"), "slack:C1:ts", Some("U1"), Some("user-99"), None)
+                .unwrap();
+        assert_eq!(binding, PrincipalBinding::AlreadyBound);
+    }
+
+    #[test]
+    fn binding_prefers_an_explicit_owner_principal_on_first_bind() {
+        let binding =
+            resolve_principal_binding(None, "slack:C1:ts", Some("U1"), Some("user-42"), None).unwrap();
+        match binding {
+            PrincipalBinding::Explicit(principal) => assert_eq!(principal.foreign_id, "user-42"),
+            other => panic!("expected Explicit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binding_falls_back_to_derivation_without_an_explicit_id() {
+        let binding = resolve_principal_binding(None, "slack:C123:ts", Some("U1"), None, None).unwrap();
+        match binding {
+            PrincipalBinding::Derived(principal) => {
+                assert_eq!(principal.foreign_id, "slack-channel-c123")
+            }
+            other => panic!("expected Derived, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binding_rejects_a_present_but_blank_explicit_id() {
+        // A present-but-blank id is malformed input, not absence: it must NOT
+        // fall through to the channel-derived (infra-role) principal.
+        let err = resolve_principal_binding(None, "slack:C123:ts", None, Some("   "), None).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::IronControlError::InvalidPrincipalForeignId { .. }
+        ));
+    }
+
+    #[test]
+    fn binding_derives_only_when_the_explicit_id_is_absent() {
+        let binding = resolve_principal_binding(None, "slack:C123:ts", None, None, None).unwrap();
+        assert!(matches!(binding, PrincipalBinding::Derived(_)));
+    }
+
+    #[test]
+    fn binding_rejects_a_malformed_explicit_id_rather_than_deriving() {
+        let err =
+            resolve_principal_binding(None, "slack:C1:ts", None, Some("bad id"), None).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::IronControlError::InvalidPrincipalForeignId { .. }
+        ));
     }
 }

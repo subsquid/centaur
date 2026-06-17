@@ -4,7 +4,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use centaur_iron_control::SessionRegistrar;
+use centaur_iron_control::{PrincipalBinding, SessionRegistrar, resolve_principal_binding};
 use centaur_sandbox_core::{
     Mount, SandboxBackend, SandboxError, SandboxId, SandboxIoGuard, SandboxRead, SandboxSpec,
     SandboxStatus, SandboxWrite,
@@ -248,11 +248,19 @@ impl SessionRuntime {
                 iron_control_enabled = self.iron_control.is_some(),
                 "creating or loading session"
             );
-            // Read slack_user_id before `metadata` is consumed below; it keys the
-            // 1:1 DM principal and is only known here at session creation.
+            // Read slack_user_id and the explicit owner principal before
+            // `metadata` is consumed below; both are only known here at session
+            // creation. slack_user_id keys a 1:1 DM principal; principal_foreign_id
+            // (sent by a privileged caller — the thread owner's personal
+            // principal) binds the session to the owner's provider key.
             let slack_user_id = metadata
                 .as_ref()
                 .and_then(|metadata| metadata.get("slack_user_id"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let owner_principal_foreign_id = metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("principal_foreign_id"))
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned);
             // The human-readable conversation name the chat bot resolved
@@ -296,26 +304,40 @@ impl SessionRuntime {
                 // proxy: without a registered principal the proxy has no identity
                 // to bind to, so a registration failure must fail session creation
                 // rather than silently boot a sandbox with a non-functional proxy.
-                let principal = registrar
-                    .register_session(
-                        thread_key.as_str(),
-                        slack_user_id.as_deref(),
-                        conversation_name.as_deref(),
-                    )
-                    .await?;
-                // Persist the principal OID on the session row so a resumed session
-                // can recreate its sandbox after a restart without re-deriving it.
-                let session = self
-                    .store
-                    .set_iron_control_principal(thread_key, Some(&principal.id))
-                    .await?;
+                //
+                // The principal is bound ONCE, at first creation. Ownership is
+                // immutable (no transfer/fork): an already-bound session keeps its
+                // first-author principal and ignores any later principal_foreign_id.
+                // An explicit owner principal is registered provider-key-only (no
+                // infra role); a thread-derived principal keeps today's infra role.
+                let session = match resolve_principal_binding(
+                    session.iron_control_principal.as_deref(),
+                    thread_key.as_str(),
+                    slack_user_id.as_deref(),
+                    owner_principal_foreign_id.as_deref(),
+                    conversation_name.as_deref(),
+                )? {
+                    PrincipalBinding::AlreadyBound => session,
+                    PrincipalBinding::Explicit(principal_ref) => {
+                        let principal = registrar.register_principal(&principal_ref, false).await?;
+                        self.store
+                            .set_iron_control_principal(thread_key, Some(&principal.id))
+                            .await?
+                    }
+                    PrincipalBinding::Derived(principal_ref) => {
+                        let principal = registrar.register_principal(&principal_ref, true).await?;
+                        self.store
+                            .set_iron_control_principal(thread_key, Some(&principal.id))
+                            .await?
+                    }
+                };
                 info!(
                     component = COMPONENT_SESSION_RUNTIME,
                     event = "session_create_or_get_completed",
                     thread_key = %thread_key,
                     harness_type = %harness_type,
                     status = %session.status,
-                    iron_control_principal_persisted = true,
+                    iron_control_principal_persisted = session.iron_control_principal.is_some(),
                     harness_switched,
                     "session ready"
                 );

@@ -23,7 +23,9 @@ pub use models::{
     PgDsnSecretInput, PgDsnSettingInput, PgDsnSettingValueFromInput, Principal, Proxy, ProxyInput,
     ReplaceConfig, RequestRule, Role, SECRET_TYPES, SecretRecord, SecretSource, StaticSecretInput,
 };
-pub use principal::{PrincipalRef, derive_principal};
+pub use principal::{
+    PrincipalBinding, PrincipalRef, derive_principal, explicit_principal, resolve_principal_binding,
+};
 pub use registry::{
     GCP_AUTH_DEFAULT_SCOPE, RegisterError, RoleSpec, SecretInput, TranslateError,
     gcp_auth_scopes_or_default, grant_inputs_to_role, register_role, secret_inputs_from_fragment,
