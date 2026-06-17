@@ -89,6 +89,7 @@ module Oauth
       result = exchange_code(params[:code], flow["code_verifier"])
       identity = @provider.identity_from(result, client_id: @app.client_id)
       @credential = upsert_credential(state, result, identity)
+      enqueue_identity_enrichment(@credential)
 
       render_result(:success, identity: identity)
     rescue Broker::ExchangeError => e
@@ -98,6 +99,11 @@ module Oauth
       # credential. Log the messages only -- never token values.
       Rails.logger.error { "oauth flow credential save failed: #{e.record.errors.full_messages.to_sentence}" }
       render_result(:error, message: "Connecting the integration failed while saving the credential.")
+    rescue ActiveRecord::RecordNotUnique
+      # A concurrent consent for the same account won the unique index on the
+      # credential or its wrapping secret. The winner's record is already saved, so
+      # the user just needs to retry; the next consent upserts cleanly.
+      render_result(:error, message: "Another consent for this account is in progress. Try again.")
     end
 
     private
@@ -123,11 +129,11 @@ module Oauth
         "client_id" => @app.client_id,
         "redirect_uri" => oauth_callback_redirect_uri(@app.slug),
         "response_type" => "code",
-        "scope" => (requested_scopes | @provider.identity_scopes).join(" "),
         "state" => state,
         "code_challenge" => challenge,
         "code_challenge_method" => "S256"
       }.merge(@provider.extra_authorization_params)
+      query[@provider.authorization_scope_param] = (requested_scopes | @provider.identity_scopes).join(@provider.scope_separator)
 
       uri = URI.parse(@provider.authorization_endpoint)
       uri.query = URI.encode_www_form(query)
@@ -141,7 +147,8 @@ module Oauth
         client_secret: @app.client_secret,
         code: code.to_s,
         redirect_uri: oauth_callback_redirect_uri(@app.slug),
-        code_verifier: code_verifier.to_s
+        code_verifier: code_verifier.to_s,
+        require_refresh_token: @provider.refreshable?
       )
     end
 
@@ -155,8 +162,8 @@ module Oauth
         credential = BrokerCredential.find_or_initialize_by(oauth_app: @app, provider_subject: identity[:subject])
         if credential.new_record?
           credential.namespace = @app.credential_namespace
-          credential.foreign_id = "#{@app.provider}-#{@app.slug}-#{identity[:subject]}"
-          credential.name = "#{@app.provider.capitalize} – #{identity[:email]}"
+          credential.foreign_id = "#{@app.provider}-#{@app.slug}-#{identity[:subject].downcase}"
+          credential.name = "#{@provider.display_name} – #{identity_display_name(identity)}"
           credential.token_endpoint = @provider.token_endpoint
           credential.external_user_key = SecureRandom.urlsafe_base64(16)
         end
@@ -166,17 +173,64 @@ module Oauth
         credential.assign_attributes(
           provider_email: identity[:email],
           # Store exactly what the IdP granted, so the refresh POST re-requests it.
-          scopes: (result.scope.presence&.split || Array(state["scopes"])),
+          scopes: granted_scopes(result, state),
           refresh_token: result.refresh_token,
           access_token: result.access_token,
           expires_at: now + expires_in,
           last_refresh: now,
           failure_count: 0, dead: false, dead_reason: nil
         )
-        credential.next_attempt_at = credential.compute_next_attempt_at(now: now)
+        credential.next_attempt_at = @provider.refreshable? ? credential.compute_next_attempt_at(now: now) : nil
         credential.save!
+        ensure_wrapping_secret(credential)
         credential
       end
+    end
+
+    def granted_scopes(result, state)
+      return Array(state["scopes"]) if result.scope.blank?
+      @provider.parse_granted_scopes(result.scope)
+    end
+
+    def identity_display_name(identity)
+      identity[:name].presence || identity[:email].presence || identity[:subject]
+    end
+
+    def enqueue_identity_enrichment(credential)
+      case @app.provider
+      when Oauth::Providers::Slack::KEY
+        Oauth::EnrichCredentialIdentityJob.perform_later(credential.id)
+      when Oauth::Providers::Github::KEY
+        Oauth::EnrichGithubCredentialIdentityJob.perform_later(credential.id)
+      end
+    end
+
+    # Wraps a minted credential in a grantable static secret, so an operator can
+    # grant the integration's token to a principal straight from the console (a
+    # broker credential is not grantable on its own). The secret injects the live
+    # access token as `Authorization: Bearer <token>` through a token_broker source
+    # pointing at the credential, scoped to the provider's API hosts. The token
+    # stays fresh because the source resolves the credential live at sync time.
+    #
+    # Created once per credential (keyed on the broker_credential association, which
+    # a unique index enforces) and left untouched on re-consent, so any operator
+    # edits -- a different header, extra rules -- survive. Has no created_by: the
+    # unauthenticated flow has no current user, like the credential it wraps. Left
+    # without a foreign_id: it is found by association, and copying the credential's
+    # would risk colliding with an operator-created secret.
+    def ensure_wrapping_secret(credential)
+      secret = StaticSecret.find_or_initialize_by(broker_credential: credential)
+      return secret unless secret.new_record?
+
+      secret.namespace = credential.namespace
+      secret.name = "#{credential.name} token"
+      secret.inject_config = { "header" => "Authorization", "formatter" => "Bearer {{ .Value }}" }
+      secret.source = SecretSource.new(source_type: "token_broker", config: { "credential_id" => credential.oid })
+      secret.rules = Array(@provider.api_hosts).each_with_index.map do |host, position|
+        RequestRule.new(host: host, http_methods: [], paths: [], position: position)
+      end
+      secret.save!
+      secret
     end
 
     def read_and_clear_flow_cookie

@@ -2,6 +2,7 @@ class StaticSecret < ApplicationRecord
   oid_prefix "ssr"
 
   include ForeignIdCollisionGuard
+  include SyncConfigCacheInvalidation
 
   has_many :grants, dependent: :destroy
 
@@ -38,7 +39,14 @@ class StaticSecret < ApplicationRecord
 
   has_one :source, class_name: "SecretSource", dependent: :destroy
   has_many :rules, class_name: "RequestRule", dependent: :destroy
-  belongs_to :created_by, class_name: "User"
+  # Optional: a static secret auto-created by the OAuth consent flow has no console
+  # operator behind it (the public flow runs unauthenticated), like the credential
+  # it wraps.
+  belongs_to :created_by, class_name: "User", optional: true
+  # Set when this secret wraps a managed broker credential (auto-created by the
+  # OAuth consent flow). The token_broker source carries the credential_id the
+  # proxy resolves at sync; this association is the console-level link.
+  belongs_to :broker_credential, optional: true
 
   # Whether this secret is one of the managed provider API keys (ANTHROPIC_API_KEY
   # / OPENAI_API_KEY) -- i.e. a `replace` secret whose proxy_value is in the
@@ -59,6 +67,27 @@ class StaticSecret < ApplicationRecord
     entry["inject"] = inject_config if inject_config.present?
     entry["replace"] = replace_config if replace_config.present?
     entry
+  end
+
+  # The request targets this secret writes, normalized for cross-type conflict
+  # detection (see Principal#served_credentials): a header (case-insensitive) or
+  # a query param. A replace with no match_headers rewrites the body/path/query
+  # rather than a header, so it claims no target and never collides with a header
+  # injector.
+  def proxy_conflict_targets
+    if inject_config.present?
+      if inject_config["header"].present?
+        [ "header:#{inject_config["header"].downcase}" ]
+      elsif inject_config["query_param"].present?
+        [ "query:#{inject_config["query_param"]}" ]
+      else
+        []
+      end
+    elsif replace_config.present?
+      Array(replace_config["match_headers"]).map { |h| "header:#{h.downcase}" }
+    else
+      []
+    end
   end
 
   validates :namespace, presence: true, format: { with: URL_SAFE_FORMAT, message: URL_SAFE_MESSAGE }

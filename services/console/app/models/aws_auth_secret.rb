@@ -11,6 +11,7 @@ class AwsAuthSecret < ApplicationRecord
   oid_prefix "aas"
 
   include ForeignIdCollisionGuard
+  include SyncConfigCacheInvalidation
 
   URL_SAFE_FORMAT = /\A[A-Za-z0-9\-._~]+\z/
   URL_SAFE_MESSAGE = "must contain only URL-safe characters (A-Z, a-z, 0-9, -, ., _, ~)"
@@ -38,6 +39,12 @@ class AwsAuthSecret < ApplicationRecord
     config["allowed_services"] = allowed_services if allowed_services.present?
     config["rules"] = rules.map(&:to_proxy_rule)
     { "name" => "aws_auth", "config" => config }
+  end
+
+  # aws_auth re-signs requests with SigV4, which owns the Authorization header;
+  # used for cross-type conflict detection in Principal#served_credentials.
+  def proxy_conflict_targets
+    [ "header:authorization" ]
   end
 
   validates :namespace, presence: true, format: { with: URL_SAFE_FORMAT, message: URL_SAFE_MESSAGE }

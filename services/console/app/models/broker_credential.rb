@@ -38,6 +38,11 @@ class BrokerCredential < ApplicationRecord
   # Set on credentials minted by the OAuth consent flow; they delegate their
   # client_id/client_secret to the app (see #effective_client_secret).
   belongs_to :oauth_app, optional: true
+  # The grantable static secret wrapping this credential (the OAuth consent flow
+  # auto-creates one; at most one, enforced by a unique index). Nullify on delete --
+  # the before_destroy guard below already blocks deletion while a token_broker
+  # source still references the credential.
+  has_one :static_secret, dependent: :nullify
 
   attr_writer :refresh_client
 
@@ -45,6 +50,7 @@ class BrokerCredential < ApplicationRecord
   # is no FK to cascade or nullify, so deletion would silently leave those secrets
   # undeliverable. The operator must remove the references first.
   before_destroy :ensure_not_referenced
+  before_commit :bump_referencing_principal_sync_config_versions, if: :sync_config_relevant_change?
 
   serialize :token_endpoint_headers, coder: JSON
   encrypts :access_token
@@ -53,7 +59,9 @@ class BrokerCredential < ApplicationRecord
   encrypts :token_endpoint_headers
 
   scope :refreshable, -> {
-    where(dead: false).where("next_attempt_at IS NULL OR next_attempt_at <= ?", Time.current)
+    where(dead: false)
+      .where("last_refresh IS NULL OR refresh_token IS NOT NULL")
+      .where("next_attempt_at IS NULL OR next_attempt_at <= ?", Time.current)
   }
 
   validates :namespace, presence: true, format: { with: URL_SAFE_FORMAT, message: URL_SAFE_MESSAGE }
@@ -145,10 +153,14 @@ class BrokerCredential < ApplicationRecord
       client_id: effective_client_id,
       client_secret: effective_client_secret,
       refresh_token: refresh_token,
-      scopes: scopes,
+      scopes: refresh_scopes_for_provider,
       headers: token_endpoint_headers || {},
       timeout: refresh_timeout_seconds
     )
+  end
+
+  def refresh_scopes_for_provider
+    oauth_app&.provider_strategy&.refresh_scopes(scopes) || scopes
   end
 
   def apply_success!(result, now:)
@@ -190,6 +202,21 @@ class BrokerCredential < ApplicationRecord
     return unless SecretSource.referencing_broker_credential(self).exists?
     errors.add(:base, "is referenced by one or more token_broker secret sources; remove those references first")
     throw :abort
+  end
+
+  def sync_config_relevant_change?
+    previous_changes.key?("access_token") ||
+      previous_changes.key?("dead") ||
+      previous_changes.key?("last_refresh") ||
+      previous_changes.key?("expires_at")
+  end
+
+  def bump_referencing_principal_sync_config_versions
+    ids = SecretSource.referencing_broker_credential(self).flat_map do |source|
+      owner = source.sync_config_owner
+      owner ? Principal.effective_grantee_ids_for_grantable(owner) : []
+    end
+    Principal.bump_sync_config_cache_versions(ids)
   end
 
   def labels_is_a_hash

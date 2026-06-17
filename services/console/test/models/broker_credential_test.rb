@@ -32,6 +32,15 @@ class BrokerCredentialTest < ActiveSupport::TestCase
     assert build_credential.valid?
   end
 
+  test "at most one wrapping static secret per credential" do
+    cred = create_credential
+    StaticSecret.create!(namespace: "default", name: "wrapper", broker_credential: cred,
+                         inject_config: { "header" => "Authorization" })
+    dup = StaticSecret.new(namespace: "default", name: "dup", broker_credential: cred,
+                           inject_config: { "header" => "Authorization" })
+    assert_raises(ActiveRecord::RecordNotUnique) { dup.save!(validate: false) }
+  end
+
   test "invalid without a client_id" do
     bc = build_credential(client_id: nil)
     refute bc.valid?
@@ -84,6 +93,18 @@ class BrokerCredentialTest < ActiveSupport::TestCase
     bc.refresh!
     assert_equal "app-cid", captured[:client_id]
     assert_equal "app-secret", captured[:client_secret]
+  end
+
+  test "refresh lets the provider choose refresh scopes" do
+    captured = {}
+    app = build_app(provider: "slack", client_id: "app-cid", client_secret: "app-secret",
+                    allowed_scopes: %w[chat:write])
+    bc = create_credential(client_id: nil, client_secret: nil, oauth_app: app,
+                           provider_subject: "U123", created_by: nil, refresh_token: "rt",
+                           scopes: %w[chat:write openid])
+    bc.refresh_client = StubClient.new { |**kw| captured = kw; result }
+    bc.refresh!
+    assert_equal [], captured[:scopes]
   end
 
   test "external_user_key must be url-safe and bounded" do

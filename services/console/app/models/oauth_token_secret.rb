@@ -8,6 +8,7 @@ class OauthTokenSecret < ApplicationRecord
   oid_prefix "ots"
 
   include ForeignIdCollisionGuard
+  include SyncConfigCacheInvalidation
 
   URL_SAFE_FORMAT = /\A[A-Za-z0-9\-._~]+\z/
   URL_SAFE_MESSAGE = "must contain only URL-safe characters (A-Z, a-z, 0-9, -, ., _, ~)"
@@ -43,6 +44,13 @@ class OauthTokenSecret < ApplicationRecord
 
     entry["rules"] = rules.map(&:to_proxy_rule)
     entry
+  end
+
+  # oauth_token injects the minted bearer into its configured header, defaulting
+  # to Authorization (the proxy's default when none is set); used for cross-type
+  # conflict detection in Principal#served_credentials.
+  def proxy_conflict_targets
+    [ "header:#{(header.presence || "Authorization").downcase}" ]
   end
 
   validates :namespace, presence: true, format: { with: URL_SAFE_FORMAT, message: URL_SAFE_MESSAGE }

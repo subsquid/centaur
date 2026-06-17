@@ -9,6 +9,7 @@ class HmacSecret < ApplicationRecord
   oid_prefix "hms"
 
   include ForeignIdCollisionGuard
+  include SyncConfigCacheInvalidation
 
   URL_SAFE_FORMAT = /\A[A-Za-z0-9\-._~]+\z/
   URL_SAFE_MESSAGE = "must contain only URL-safe characters (A-Z, a-z, 0-9, -, ., _, ~)"
@@ -46,6 +47,12 @@ class HmacSecret < ApplicationRecord
     }
     config["allow_chunked_body"] = true if allow_chunked_body
     { "name" => "hmac_sign", "config" => config }
+  end
+
+  # hmac_sign injects its signature (and companion values) into the named request
+  # headers; used for cross-type conflict detection in Principal#served_credentials.
+  def proxy_conflict_targets
+    headers.map { |h| "header:#{h["name"].downcase}" }
   end
 
   validates :namespace, presence: true, format: { with: URL_SAFE_FORMAT, message: URL_SAFE_MESSAGE }

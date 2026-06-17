@@ -37,17 +37,23 @@ impl SessionRegistrar {
     }
 
     /// Upsert the thread-derived principal and grant it the configured infra
-    /// role. ``slack_user_id`` keys a 1:1 DM principal; it is ignored for channel
-    /// threads. The legacy path for threads with no explicit owner. Returns the
+    /// role (the legacy path for threads with no explicit owner). ``slack_user_id``
+    /// keys a 1:1 DM principal; it is ignored for channel threads.
+    /// ``conversation_name`` is the human-readable channel/DM name (when the
+    /// slackbot resolved one) used as the principal's display name. Returns the
     /// upserted record (its ``id`` is the OID) so callers can bind the session's
     /// egress proxy to the same identity. Idempotent.
     pub async fn register_session(
         &self,
         thread_key: &str,
         slack_user_id: Option<&str>,
+        conversation_name: Option<&str>,
     ) -> Result<Principal> {
-        self.register_principal(&derive_principal(thread_key, slack_user_id), true)
-            .await
+        self.register_principal(
+            &derive_principal(thread_key, slack_user_id, conversation_name),
+            true,
+        )
+        .await
     }
 
     /// Upsert ``principal`` and, when ``assign_roles`` is set, grant it the

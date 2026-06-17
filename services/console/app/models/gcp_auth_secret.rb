@@ -7,6 +7,7 @@ class GcpAuthSecret < ApplicationRecord
   oid_prefix "gas"
 
   include ForeignIdCollisionGuard
+  include SyncConfigCacheInvalidation
 
   URL_SAFE_FORMAT = /\A[A-Za-z0-9\-._~]+\z/
   URL_SAFE_MESSAGE = "must contain only URL-safe characters (A-Z, a-z, 0-9, -, ., _, ~)"
@@ -36,6 +37,12 @@ class GcpAuthSecret < ApplicationRecord
     config["scopes"] = scopes
     config["rules"] = rules.map(&:to_proxy_rule)
     { "name" => "gcp_auth", "config" => config }
+  end
+
+  # gcp_auth always sets the Authorization header (a Bearer access token); used
+  # for cross-type conflict detection in Principal#served_credentials.
+  def proxy_conflict_targets
+    [ "header:authorization" ]
   end
 
   validates :namespace, presence: true, format: { with: URL_SAFE_FORMAT, message: URL_SAFE_MESSAGE }
