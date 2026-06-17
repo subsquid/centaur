@@ -3,7 +3,6 @@ import { randomUUID } from 'node:crypto'
 import { Hono, type Context } from 'hono'
 import {
   Chat,
-  StreamingPlan,
   type Adapter,
   type Logger,
   type Message as ChatMessage,
@@ -31,6 +30,17 @@ import {
 } from './session-api'
 import { extractMessageOverrides } from './overrides'
 import { isOwnerPrincipalConfigured, resolveOwnerPrincipal } from './owner-principal'
+import {
+  dmRunThreadId,
+  editSlackMessage,
+  fetchSlackPermalink,
+  isDmChannelMessage,
+  openOwnerDm,
+  runRootText,
+  runStatusText,
+  sendSlackMessage,
+  type RunStatusState
+} from './slack-run-thread'
 import { isAllowedSlackMessage, isAllowedSlackWebhookBody } from './slack-events'
 import type {
   ForwardSessionInput,
@@ -41,6 +51,8 @@ import type {
   SlackbotV2Options,
   SlackbotV2RenderObligation,
   SlackbotV2RendererSource,
+  SlackbotV2RunContext,
+  SlackbotV2SourceStatusRef,
   SlackbotV2ThreadOwner,
   SlackbotV2ThreadState,
   SlackbotV2Trace
@@ -95,6 +107,9 @@ const SLACK_TASK_DETAILS_MAX_CHARS = 500
 const SLACK_FALLBACK_TEXT_MAX_CHARS = 35_000
 const POSTGRES_CONNECT_INITIAL_DELAY_MS = 250
 const POSTGRES_CONNECT_MAX_DELAY_MS = 10_000
+// How long the per-mention DM run-thread mapping is kept so a Slack webhook retry
+// reuses the already-spawned run instead of opening a duplicate (NEW_MULTITENANT).
+const DM_RUN_STATE_TTL_MS = 24 * 60 * 60 * 1000
 
 export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   const userName = options.userName ?? 'centaur'
@@ -118,18 +133,25 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
 
   chat.onNewMention(async (thread, message) => {
     if (!isAllowedSlackMessage(message, options, logger)) return
-    await thread.subscribe()
-    await syncThreadMessageToSession(thread, message, {
-      mode: 'execute',
-      options,
-      state
-    })
+    if (isDmChannelMessage(message)) {
+      // The mention already happens in the owner's 1:1 DM: run in place (the DM is
+      // private and the owner gate is satisfied for free), no source-thread pointer.
+      await thread.subscribe()
+      await syncThreadMessageToSession(thread, message, { mode: 'execute', options, state })
+      return
+    }
+    // A mention in a shared thread spawns a fresh private run in the mentioner's DM
+    // (NEW_MULTITENANT); the source thread keeps only a dynamic status pointer.
+    await startDmRunThread(chat, thread, message, { options, state })
   })
 
   chat.onSubscribedMessage(async (thread, message) => {
     if (!isAllowedSlackMessage(message, options, logger)) return
+    // Inside a 1:1 DM run-thread every owner reply drives a turn; in any other
+    // subscribed thread only an explicit mention executes.
+    const execute = message.isMention === true || isDmChannelMessage(message)
     await syncThreadMessageToSession(thread, message, {
-      mode: message.isMention === true ? 'execute' : 'append',
+      mode: execute ? 'execute' : 'append',
       options,
       state
     })
@@ -246,6 +268,13 @@ async function syncThreadMessageToSession(
     mode: SlackbotV2MessageMode
     options: SlackbotV2Options
     state: StateAdapter
+    /**
+     * Present when this run lives in a DM run-thread distinct from the triggering
+     * message's own thread (NEW_MULTITENANT). Forces context to be collected from
+     * the SOURCE thread (`message.raw`) rather than this (DM) thread, and carries
+     * the source-thread status pointer through to the obligation + finalize.
+     */
+    runContext?: SlackbotV2RunContext
   }
 ): Promise<void> {
   const traceStartedAtMs = nowMs()
@@ -254,7 +283,10 @@ async function syncThreadMessageToSession(
   const executedMessageIds = new Set(state.executedMessageIds ?? [])
   const shouldStartExecution =
     input.mode === 'execute' && state.activeExecution !== true && !executedMessageIds.has(message.id)
-  const shouldRefreshThreadContext = shouldStartExecution && isSlackThreadReply(message)
+  // A DM run forwards the SOURCE thread (the mention's own raw channel/thread_ts),
+  // not this DM thread — so always refresh from Slack on the first execute.
+  const isDmRun = input.runContext !== undefined
+  const shouldRefreshThreadContext = shouldStartExecution && (isDmRun || isSlackThreadReply(message))
   const shouldIncludeContext =
     shouldStartExecution && (state.historyForwarded !== true || shouldRefreshThreadContext)
   const isDuplicateIncrementalMessage =
@@ -442,7 +474,12 @@ async function syncThreadMessageToSession(
         message: serializedMessage,
         // Persist the owner principal so the recovery sweep re-forwards under it
         // (Part 3d/3f) without a fresh Slack-profile + console round-trip.
-        principalForeignId
+        principalForeignId,
+        // Carry the source-thread status pointer so the recovery sweep can finalize
+        // it (✅/❌) after a crash (NEW_MULTITENANT).
+        ...(input.runContext?.sourceStatus
+          ? { sourceStatus: input.runContext.sourceStatus }
+          : {})
       }
     })
     await indexRenderObligation(input.state, {
@@ -540,6 +577,8 @@ async function syncThreadMessageToSession(
         error: errorMessage(renderError)
       })
     }
+    // The run never started: finalize the source-thread status pointer as failed.
+    await finalizeSourceStatus(input.options, input.runContext?.sourceStatus, 'failed', trace)
     traceLog(input.options, 'slackbotv2_forward_complete', trace, {
       latest_active_execution: latest.activeExecution === true,
       last_event_id: lastEventId
@@ -652,11 +691,17 @@ async function renderExecutionAttempt(
     throw error
   } finally {
     const latest = (await thread.state) ?? {}
+    // Read the source-thread status pointer before the obligation is cleared, so a
+    // completed DM run finalizes it (NEW_MULTITENANT).
+    const sourceStatus = latest.renderObligation?.sourceStatus
     await thread.setState({
       activeExecution: retry,
       lastEventId: Math.max(latest.lastEventId ?? 0, getLastEventId(), fallbackLastEventId),
       ...(rendered ? { renderObligation: null } : {})
     })
+    if (rendered) {
+      await finalizeSourceStatus(options, sourceStatus, 'done', trace)
+    }
     traceLog(options, 'slackbotv2_render_finalized', trace, {
       obligation_cleared: rendered,
       retry_scheduled: retry,
@@ -833,6 +878,7 @@ async function recoverRenderObligations(
           lastEventId: threadState?.lastEventId ?? 0,
           renderObligation: null
         })
+        await finalizeSourceStatus(options, obligation.sourceStatus, 'failed')
         continue
       }
 
@@ -963,6 +1009,7 @@ async function recoverRenderObligation(
       lastEventId,
       renderObligation: null
     })
+    await finalizeSourceStatus(options, obligation.sourceStatus, 'failed', trace)
     return false
   }
 
@@ -1016,6 +1063,9 @@ async function recoverRenderObligation(
       lastEventId: Math.max(latest.lastEventId ?? 0, lastEventId),
       ...(rendered ? { renderObligation: null } : {})
     })
+    if (rendered) {
+      await finalizeSourceStatus(options, obligation.sourceStatus, 'done', trace)
+    }
     traceLog(options, 'slackbotv2_render_recovery_finalized', trace, {
       obligation_cleared: rendered,
       last_event_id: lastEventId
@@ -1150,11 +1200,17 @@ async function renderExecutionStream(
       )
     )
     if (!visibleStream) return
-    await thread.post(
-      new StreamingPlan(
-        visibleStream,
-        { groupTasks: options.streamTaskDisplayMode ?? 'plan' }
-      )
+    // Stream with an explicit recipient (not thread.post) so this works on the
+    // synthetic DM run-thread too: a thread addressed via chat.thread(id) has no
+    // inbound "current message" for the adapter to derive the recipient from.
+    await thread.adapter.stream!(
+      thread.id,
+      visibleStream,
+      {
+        recipientTeamId: message.teamId,
+        recipientUserId: message.author.userId,
+        taskDisplayMode: options.streamTaskDisplayMode ?? 'plan'
+      }
     )
   } finally {
     await setAssistantStatus(thread, '')
@@ -1419,13 +1475,210 @@ function ownerIdentityFromMessage(message: SlackbotV2ApiMessage): SlackbotV2Thre
   return teamId ? { slackUserId, teamId } : { slackUserId }
 }
 
+/** The persisted mention -> DM run-thread mapping, used to make spawns idempotent. */
+type PersistedDmRun = {
+  dmChannel: string
+  runThreadId: string
+  sourceStatus?: SlackbotV2SourceStatusRef
+}
+
+/** State key for a mention's spawned DM run (NEW_MULTITENANT idempotency). */
+function dmRunStateKey(owner: SlackbotV2ThreadOwner, messageId: string): string {
+  return `slackbotv2:dmrun:${owner.teamId ?? ''}:${messageId}`
+}
+
 /**
- * Tell the owner to register a provider key, when their owner-triggered run was
- * skipped for lack of one. The run is already failed closed (never under a shared
- * key); this is the user-facing nudge.
+ * Spawn a fresh private run in the mentioner's 1:1 DM and leave a dynamic status
+ * pointer in the source thread (NEW_MULTITENANT). The owner is the mention author
+ * (per request, NOT a thread-wide claim); the session is keyed by the DM
+ * run-thread and runs under the owner's principal; the source-thread history is
+ * forwarded into the session exactly as before.
  *
- * TODO(multitenant): post this as an ephemeral Slack reply to the owner once the
- * chat adapter's post API is wired in; for now it logs so the skip is observable.
+ * Idempotent per mention: a Slack webhook retry (after a retryable handoff error)
+ * reuses the already-spawned DM run-thread instead of opening a duplicate.
+ */
+async function startDmRunThread(
+  chat: Chat<Record<string, Adapter>, SlackbotV2ThreadState>,
+  sourceThread: Thread<SlackbotV2ThreadState>,
+  message: ChatMessage,
+  input: { options: SlackbotV2Options; state: StateAdapter }
+): Promise<void> {
+  const { options, state } = input
+  const trace: SlackbotV2Trace = {
+    includeContext: true,
+    messageId: message.id,
+    mode: 'execute',
+    openStream: true,
+    startedAtMs: nowMs(),
+    threadId: sourceThread.id
+  }
+
+  const serialized = await serializeMessage(message)
+  const owner = ownerIdentityFromMessage(serialized)
+  if (!owner) {
+    traceLog(options, 'slackbotv2_dm_run_owner_unresolved', trace, { message_id: message.id })
+    return
+  }
+
+  // Reuse an already-spawned run on reprocess (Slack retry): re-drive the session
+  // on the existing DM run-thread instead of opening a duplicate DM + status.
+  const runStateKey = dmRunStateKey(owner, message.id)
+  const existingRun = await state.get<PersistedDmRun>(runStateKey)
+  if (existingRun) {
+    traceLog(options, 'slackbotv2_dm_run_reused', trace, {
+      owner_user_id: owner.slackUserId,
+      run_thread_id: existingRun.runThreadId
+    })
+    await syncThreadMessageToSession(chat.thread(existingRun.runThreadId), message, {
+      mode: 'execute',
+      options,
+      runContext: { sourceStatus: existingRun.sourceStatus },
+      state
+    })
+    return
+  }
+
+  // Pre-gate on the owner's provider key BEFORE opening a DM or posting anything:
+  // fail closed (never a shared key) and prompt onboarding in the source thread.
+  // The principal itself is threaded into the session by the run-thread's own
+  // forward (syncThreadMessageToSession resolves it against the DM thread owner).
+  if (isOwnerPrincipalConfigured(options)) {
+    const resolved = await resolveOwnerPrincipal(options, owner)
+    if (!resolved || !resolved.hasProviderKey) {
+      traceLog(options, 'slackbotv2_dm_run_no_provider_key', trace, {
+        has_provider_key: resolved?.hasProviderKey === true,
+        owner_user_id: owner.slackUserId,
+        resolved: Boolean(resolved)
+      })
+      await postOwnerOnboardingPrompt(sourceThread, owner, options)
+      return
+    }
+  }
+
+  // Open the owner's 1:1 DM — the private run surface. Fail closed with a notice.
+  const dmChannel = await openOwnerDm(options, owner.slackUserId)
+  if (!dmChannel) {
+    traceLog(options, 'slackbotv2_dm_run_open_failed', trace, { owner_user_id: owner.slackUserId })
+    await postDmOpenFailureNotice(sourceThread, owner, options)
+    return
+  }
+
+  // Post the run-thread root in the DM: a task summary + a link back to the source.
+  const sourceLink = await sourceThreadPermalink(options, message)
+  const taskTitle = titleFromMessage(serialized.text, options.userName)
+  const root = await sendSlackMessage(options, {
+    channel: dmChannel,
+    text: runRootText({ taskTitle, sourceLink })
+  })
+  if (!root) {
+    traceLog(options, 'slackbotv2_dm_run_root_failed', trace, { owner_user_id: owner.slackUserId })
+    await postDmOpenFailureNotice(sourceThread, owner, options)
+    return
+  }
+  const runThreadId = dmRunThreadId(dmChannel, root.ts)
+  const runPermalink = await fetchSlackPermalink(options, dmChannel, root.ts)
+  const ownerMention = `<@${owner.slackUserId}>`
+
+  // Subscribe the DM run-thread so the owner's later in-thread replies iterate.
+  const runThread = chat.thread(runThreadId)
+  await runThread.subscribe()
+
+  // Post the dynamic status pointer in the source thread, linking to the DM run.
+  let sourceStatus: SlackbotV2SourceStatusRef | undefined
+  const statusTarget = slackThreadTarget(message)
+  if (statusTarget) {
+    const posted = await sendSlackMessage(options, {
+      channel: statusTarget.channel,
+      threadTs: statusTarget.threadTs,
+      text: runStatusText('running', { ownerMention, runPermalink })
+    })
+    if (posted) {
+      sourceStatus = {
+        channel: posted.channel,
+        ts: posted.ts,
+        ownerMention,
+        permalink: runPermalink
+      }
+    }
+  }
+
+  // Persist the mention -> run mapping BEFORE driving the session, so a Slack retry
+  // after a retryable handoff error reuses this run-thread rather than spawning a
+  // duplicate (the reuse branch above).
+  await state.set(runStateKey, { dmChannel, runThreadId, sourceStatus }, DM_RUN_STATE_TTL_MS)
+
+  traceLog(options, 'slackbotv2_dm_run_started', trace, {
+    dm_channel: dmChannel,
+    owner_user_id: owner.slackUserId,
+    run_thread_id: runThreadId
+  })
+
+  // Drive the first execution keyed by the DM run-thread: the session is keyed by
+  // the DM, context is forwarded from the SOURCE thread (the mention's own raw),
+  // and the agent stream renders into the DM.
+  await syncThreadMessageToSession(runThread, message, {
+    mode: 'execute',
+    options,
+    state,
+    runContext: { sourceStatus }
+  })
+}
+
+/**
+ * Finalize the source-thread status pointer (NEW_MULTITENANT) to its terminal
+ * state. No-op when there is no pointer (run-in-place DM). Best-effort: a failed
+ * Slack update must never break finalize or recovery.
+ */
+async function finalizeSourceStatus(
+  options: SlackbotV2Options,
+  sourceStatus: SlackbotV2SourceStatusRef | undefined,
+  state: RunStatusState,
+  trace?: SlackbotV2Trace
+): Promise<void> {
+  if (!sourceStatus) return
+  const ok = await editSlackMessage(
+    options,
+    sourceStatus,
+    runStatusText(state, {
+      ownerMention: sourceStatus.ownerMention,
+      runPermalink: sourceStatus.permalink
+    })
+  )
+  if (!ok) {
+    traceLog(options, 'slackbotv2_source_status_finalize_failed', trace, {
+      channel: sourceStatus.channel,
+      state,
+      ts: sourceStatus.ts
+    })
+  }
+}
+
+/** The source thread to anchor the status pointer in: channel + thread root ts. */
+function slackThreadTarget(message: ChatMessage): { channel: string; threadTs: string } | null {
+  const raw = slackRawRecord(message)
+  const channel = stringField(raw.channel)
+  if (!channel) return null
+  const ts = stringField(raw.ts) || message.id
+  const threadTs = stringField(raw.thread_ts) || ts
+  return { channel, threadTs }
+}
+
+/** Permalink to the triggering mention, shown in the DM run-thread root message. */
+async function sourceThreadPermalink(
+  options: SlackbotV2Options,
+  message: ChatMessage
+): Promise<string | undefined> {
+  const raw = slackRawRecord(message)
+  const channel = stringField(raw.channel)
+  const ts = stringField(raw.ts) || message.id
+  if (!channel || !ts) return undefined
+  return fetchSlackPermalink(options, channel, ts)
+}
+
+/**
+ * Tell the owner (in the source thread, where they are) to register a provider
+ * key, when their run was skipped for lack of one. The run already failed closed
+ * (never a shared key); this is the user-facing nudge. Best-effort post.
  */
 async function postOwnerOnboardingPrompt(
   thread: Thread<SlackbotV2ThreadState>,
@@ -1433,14 +1686,49 @@ async function postOwnerOnboardingPrompt(
   options: SlackbotV2Options
 ): Promise<void> {
   const logger = options.logger ?? noopLogger
-  const link = options.consoleUrl
+  const url = options.consoleUrl
     ? `${options.consoleUrl.replace(/\/+$/, '')}/console/provider_keys`
-    : 'the Centaur console'
+    : undefined
+  const link = url ? `<${url}|the Centaur console>` : 'the Centaur console'
   logger.warn('slackbotv2_owner_onboarding_prompt', {
     owner_user_id: owner.slackUserId,
-    prompt: `Register your provider API key at ${link} to run the agent under your own key.`,
     thread_id: thread.id
   })
+  await safeThreadPost(
+    thread,
+    options,
+    `<@${owner.slackUserId}> register your provider API key at ${link} to run the agent under your own key.`,
+    'slackbotv2_owner_onboarding_post_failed'
+  )
+}
+
+/** Notify (in the source thread) that the bot could not open the owner's DM. */
+async function postDmOpenFailureNotice(
+  thread: Thread<SlackbotV2ThreadState>,
+  owner: SlackbotV2ThreadOwner,
+  options: SlackbotV2Options
+): Promise<void> {
+  await safeThreadPost(
+    thread,
+    options,
+    `<@${owner.slackUserId}> I couldn't open a DM to start your private run. `
+      + 'Open a direct message with me (check that DMs are enabled), then mention me again.',
+    'slackbotv2_dm_open_notice_post_failed'
+  )
+}
+
+/** Post into a thread, swallowing failures (prompts/notices are best-effort). */
+async function safeThreadPost(
+  thread: Thread<SlackbotV2ThreadState>,
+  options: SlackbotV2Options,
+  text: string,
+  failureEvent: string
+): Promise<void> {
+  try {
+    await thread.post(text)
+  } catch (error) {
+    traceLog(options, failureEvent, undefined, { error: errorMessage(error) })
+  }
 }
 
 function isSlackThreadReply(message: ChatMessage): boolean {

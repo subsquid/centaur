@@ -144,6 +144,35 @@ export type SlackbotV2RenderObligation = {
    * copy; the sweep falls back to the live `state.owner.principalForeignId`.
    */
   principalForeignId?: string
+  /**
+   * The source-thread status pointer for a DM run-thread (NEW_MULTITENANT), so
+   * the recovery sweep can finalize it (✅/❌) after a crash instead of leaving it
+   * stuck on "Running…". Absent for a run-in-place DM mention (no pointer).
+   */
+  sourceStatus?: SlackbotV2SourceStatusRef
+}
+
+/**
+ * A handle to the dynamic status message the bot maintains in the source thread,
+ * pointing at the owner's DM run-thread (NEW_MULTITENANT). `permalink`/`ownerMention`
+ * are carried so a finalize (`chat.update`) can re-render the pointer text without
+ * another Slack round-trip.
+ */
+export type SlackbotV2SourceStatusRef = {
+  channel: string
+  ts: string
+  ownerMention?: string
+  permalink?: string
+}
+
+/**
+ * Extra context for a session run that lives in a DM run-thread distinct from the
+ * triggering message's own thread (NEW_MULTITENANT). Present only on the first
+ * execution of a freshly spawned DM run; absent for in-DM iteration and the
+ * run-in-place path.
+ */
+export type SlackbotV2RunContext = {
+  sourceStatus?: SlackbotV2SourceStatusRef
 }
 
 export type SlackbotV2MessageMode = 'append' | 'execute'
