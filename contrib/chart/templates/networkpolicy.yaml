@@ -33,6 +33,22 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
+{{- with .Values.networkPolicy.dnsServerCidrs }}
+    # Extra DNS resolver IPs reachable by ipBlock rather than namespaceSelector.
+    # Needed on GKE with NodeLocal DNSCache, whose resolver runs hostNetwork and
+    # so is not selectable as a kube-system pod (link-local 169.254.20.10 + the
+    # kube-dns ClusterIP). Empty by default (K3s needs nothing here).
+    - to:
+{{- range . }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+{{- end }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+{{- end }}
 ---
 {{- if .Values.postgres.enabled }}
 apiVersion: networking.k8s.io/v1

@@ -1,0 +1,98 @@
+# Pin the whole Centaur stack to a dedicated spot node pool.
+#
+# Pool contract (created out-of-band, see deploy notes):
+#   label:  centaur-pool=true
+#   taint:  centaur=true:NoSchedule   (so nothing else lands on the pool)
+#
+# Layer AFTER the image + env overlays, e.g.:
+#   helm upgrade --install centaur contrib/chart -n centaur --create-namespace \
+#     -f contrib/chart/values.dev.yaml \
+#     -f contrib/chart/values.mo4islona.yaml \
+#     -f contrib/chart/values.mo4islona-pool.yaml
+#
+# Control-plane scheduling (api-rs / slackbotv2 / postgres / repo-cache) is the
+# chart support added in PR feat/chart-node-scheduling. Sandbox runtime pods are
+# pinned via api-rs (SESSION_SANDBOX_NODE_SELECTOR / _TOLERATIONS on extraEnv),
+# which requires the api-rs build carrying that support.
+
+# GKE runs NodeLocal DNSCache (hostNetwork resolver), which the chart's default
+# kube-system namespaceSelector DNS rule does not cover, so pod DNS is denied.
+# Allow the node-local resolver + kube-dns ClusterIP by ipBlock.
+networkPolicy:
+  dnsServerCidrs:
+    - 169.254.20.10/32
+    - 10.0.16.10/32
+
+apiRs:
+  nodeSelector:
+    centaur-pool: "true"
+  tolerations:
+    - key: centaur
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  extraEnv:
+    SESSION_SANDBOX_NODE_SELECTOR: "centaur-pool=true"
+    SESSION_SANDBOX_TOLERATIONS: '[{"key":"centaur","operator":"Equal","value":"true","effect":"NoSchedule"}]'
+
+slackbotv2:
+  nodeSelector:
+    centaur-pool: "true"
+  tolerations:
+    - key: centaur
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+
+postgres:
+  nodeSelector:
+    centaur-pool: "true"
+  tolerations:
+    - key: centaur
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  persistence:
+    # premium-rwo = pd-ssd, and WaitForFirstConsumer so the PD is provisioned in
+    # the pod's zone. The default `standard` class is HDD + Immediate-binding
+    # (wrong zone), which fails to attach to the single-zone pool.
+    storageClassName: premium-rwo
+    # PGDATA must be a subdirectory of the mount: a freshly-formatted PD mounted
+    # directly at /var/lib/postgresql/data carries an ext4 lost+found, and initdb
+    # refuses a non-empty data dir.
+    subPath: pgdata
+
+# repo-cache hostPath DaemonSet: confine it to the pool so it runs only on the
+# pool node(s) (not every cluster node) and colocates with the sandbox pods that
+# read its hostPath.
+repoCache:
+  nodeSelector:
+    centaur-pool: "true"
+  tolerations:
+    - key: centaur
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+
+# console = the iron-control plane api-rs binds to (IRON_CONTROL_URL). Required
+# when apiRs.ironProxy.mode != disabled. Reads its config from centaur-infra-env
+# (IRON_CONTROL_* keys seeded by bootstrap) and self-provisions its DBs.
+console:
+  enabled: true
+  nodeSelector:
+    centaur-pool: "true"
+  tolerations:
+    - key: centaur
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+
+# agent-sandbox controller (subchart) — pin to the pool too.
+agentSandbox:
+  nodeSelector:
+    centaur-pool: "true"
+  tolerations:
+    - key: centaur
+      operator: Equal
+      value: "true"
+      effect: NoSchedule

@@ -50,6 +50,18 @@ spec:
       imagePullSecrets:
 {{ toYaml . | nindent 8 }}
       {{- end }}
+      {{- with .Values.console.nodeSelector }}
+      nodeSelector:
+{{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.console.affinity }}
+      affinity:
+{{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.console.tolerations }}
+      tolerations:
+{{ toYaml . | nindent 8 }}
+      {{- end }}
       initContainers:
         # Create the console logical databases on the bundled Postgres: the
         # primary plus the Solid Cache/Queue/Cable databases (see

@@ -1,0 +1,120 @@
+name: Publish Images (mo4islona / Docker Hub)
+
+# Personal/dev image publish to Docker Hub under docker.io/mo4islona/centaur-*.
+# Separate from publish-images.yml (which targets the upstream GHCR namespace).
+# Single-arch linux/amd64 only — the target GKE node pools are all amd64, so
+# skipping arm64 + the digest/merge dance keeps this fast.
+#
+# Requires two repo secrets: DOCKERHUB_USERNAME and DOCKERHUB_TOKEN
+# (a Docker Hub access token with Read/Write).
+
+on:
+  workflow_dispatch:
+    inputs:
+      extra_tag:
+        description: "Extra tag to publish alongside latest + sha (e.g. per-user-tenancy)"
+        required: false
+        default: ""
+  push:
+    branches: [feat/per-user-tenancy]
+    paths:
+      - .github/workflows/publish-images-mo4islona.yml
+      - services/**
+      - centaur_sdk/**
+      - packages/**
+      - tools/**
+      - package.json
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
+      - .agents/skills/**
+
+concurrency:
+  group: publish-mo4islona-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: docker.io
+  IMAGE_NAMESPACE: mo4islona
+  IMAGE_SOURCE: https://github.com/subsquid/centaur
+  RUST_BUILD_PROFILE: release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: centaur-api-rs
+            context: .
+            dockerfile: services/api-rs/Dockerfile
+            target: ""
+          - image: centaur-slackbotv2
+            context: .
+            dockerfile: services/slackbotv2/Dockerfile
+            target: ""
+          - image: centaur-discordbot
+            context: .
+            dockerfile: services/discordbot/Dockerfile
+            target: ""
+          - image: centaur-agent
+            context: .
+            dockerfile: services/sandbox/Dockerfile
+            target: sandbox
+          - image: centaur-iron-proxy
+            context: .
+            dockerfile: services/iron-proxy/Dockerfile
+            target: ""
+          - image: centaur-console
+            context: services/console
+            dockerfile: services/console/Dockerfile
+            target: ""
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Docker metadata for ${{ matrix.image }}
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=latest
+            type=sha
+            type=raw,value=${{ github.event.inputs.extra_tag }},enable=${{ github.event.inputs.extra_tag != '' }}
+          labels: |
+            org.opencontainers.image.title=${{ matrix.image }}
+            org.opencontainers.image.source=${{ env.IMAGE_SOURCE }}
+
+      - name: Build and push ${{ matrix.image }}
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            RUST_BUILD_PROFILE=${{ env.RUST_BUILD_PROFILE }}
+          cache-from: type=gha,scope=mo4islona-${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=mo4islona-${{ matrix.image }}

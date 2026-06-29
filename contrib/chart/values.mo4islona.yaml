@@ -1,0 +1,39 @@
+# Image overrides pointing the chart at the personal Docker Hub namespace
+# (docker.io/mo4islona/centaur-*), built by .github/workflows/publish-images-mo4islona.yml.
+#
+# Layer this AFTER the environment values file, e.g.:
+#   helm upgrade --install centaur contrib/chart -n centaur --create-namespace \
+#     -f contrib/chart/values.dev.yaml -f contrib/chart/values.mo4islona.yaml
+#
+# tag stays "latest" (set in the base chart); pullPolicy: Always so the mutable
+# latest tag is re-pulled on each rollout.
+
+apiRs:
+  image:
+    repository: docker.io/mo4islona/centaur-api-rs
+    pullPolicy: Always
+
+slackbotv2:
+  image:
+    repository: docker.io/mo4islona/centaur-slackbotv2
+    pullPolicy: Always
+
+discordbot:
+  image:
+    repository: docker.io/mo4islona/centaur-discordbot
+    pullPolicy: Always
+
+sandbox:
+  image:
+    repository: docker.io/mo4islona/centaur-agent
+    pullPolicy: Always
+
+ironProxy:
+  image:
+    repository: docker.io/mo4islona/centaur-iron-proxy
+    pullPolicy: Always
+
+console:
+  image:
+    repository: docker.io/mo4islona/centaur-console
+    pullPolicy: Always
