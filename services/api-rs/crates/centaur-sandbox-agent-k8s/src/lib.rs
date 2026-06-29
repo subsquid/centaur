@@ -72,6 +72,12 @@ pub struct AgentSandboxConfig {
     /// harness's usage/cost spans never leave the pod.
     pub otlp_egress: Option<OtlpEgressTarget>,
     pub ready_timeout: Duration,
+    /// `nodeSelector` applied to every sandbox pod. Empty = none. Lets the
+    /// control plane confine sandboxes to a dedicated node pool (e.g. spot).
+    pub node_selector: BTreeMap<String, String>,
+    /// Toleration objects applied verbatim to every sandbox pod, so sandboxes
+    /// can schedule onto a tainted node pool. Empty = none.
+    pub tolerations: Vec<Value>,
 }
 
 /// Destination of the sandbox's direct OTLP export, expressed as the target
@@ -113,6 +119,8 @@ impl AgentSandboxConfig {
             tools: None,
             otlp_egress: None,
             ready_timeout: Duration::from_secs(60),
+            node_selector: BTreeMap::new(),
+            tolerations: Vec::new(),
         }
     }
 
@@ -711,6 +719,16 @@ fn build_agent_sandbox(
                 .collect::<Vec<_>>()
         }),
     );
+    insert_optional(
+        &mut pod_spec,
+        "nodeSelector",
+        (!config.node_selector.is_empty()).then(|| config.node_selector.clone()),
+    );
+    insert_optional(
+        &mut pod_spec,
+        "tolerations",
+        (!config.tolerations.is_empty()).then(|| config.tolerations.clone()),
+    );
 
     let mut agent_spec = json!({
         "replicas": 1,
@@ -903,6 +921,47 @@ mod tests {
         assert_eq!(container.stdin, Some(true));
         assert_eq!(container.volume_mounts.as_ref().unwrap().len(), 2);
         assert!(container.resources.as_ref().unwrap().limits.is_some());
+    }
+
+    #[test]
+    fn node_selector_and_tolerations_land_on_the_pod() {
+        let spec = SandboxSpec::new("centaur-agent:latest");
+        let mut config = AgentSandboxConfig::new("centaur");
+        config
+            .node_selector
+            .insert("centaur-pool".to_owned(), "true".to_owned());
+        config.tolerations.push(json!({
+            "key": "centaur",
+            "operator": "Equal",
+            "value": "true",
+            "effect": "NoSchedule",
+        }));
+
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        let pod_spec = &sandbox.spec.pod_template.spec;
+
+        assert_eq!(
+            pod_spec
+                .node_selector
+                .as_ref()
+                .and_then(|selector| selector.get("centaur-pool"))
+                .map(String::as_str),
+            Some("true")
+        );
+        let tolerations = pod_spec.tolerations.as_ref().unwrap();
+        assert_eq!(tolerations.len(), 1);
+        assert_eq!(tolerations[0].key.as_deref(), Some("centaur"));
+        assert_eq!(tolerations[0].effect.as_deref(), Some("NoSchedule"));
+
+        // Unset by default: no nodeSelector/tolerations on the pod.
+        let bare = build_agent_sandbox(
+            &SandboxId::new("asbx-bare"),
+            &spec,
+            &AgentSandboxConfig::new("centaur"),
+        )
+        .unwrap();
+        assert!(bare.spec.pod_template.spec.node_selector.is_none());
+        assert!(bare.spec.pod_template.spec.tolerations.is_none());
     }
 
     #[test]

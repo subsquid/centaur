@@ -509,6 +509,22 @@ struct SandboxArgs {
         value_delimiter = ','
     )]
     image_pull_secrets: Vec<String>,
+    /// `key=value` pairs set as the `nodeSelector` on every sandbox pod, e.g.
+    /// to pin sandboxes to a dedicated (spot) node pool.
+    #[arg(
+        long = "session-sandbox-node-selector",
+        env = "SESSION_SANDBOX_NODE_SELECTOR",
+        value_delimiter = ','
+    )]
+    node_selector: Vec<String>,
+    /// JSON array of toleration objects applied to every sandbox pod, so they
+    /// can schedule onto a tainted node pool, e.g.
+    /// `[{"key":"centaur","operator":"Equal","value":"true","effect":"NoSchedule"}]`.
+    #[arg(
+        long = "session-sandbox-tolerations",
+        env = "SESSION_SANDBOX_TOLERATIONS"
+    )]
+    tolerations: Option<String>,
     #[arg(
         long = "session-sandbox-ready-timeout-secs",
         alias = "kubernetes-sandbox-ready-timeout-s",
@@ -1326,6 +1342,25 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
             .map(str::to_owned)
             .collect();
         config.ready_timeout = Duration::from_secs(args.ready_timeout_secs);
+        config.node_selector = args
+            .node_selector
+            .iter()
+            .filter_map(|entry| entry.split_once('='))
+            .map(|(key, value)| (key.trim().to_owned(), value.trim().to_owned()))
+            .filter(|(key, _)| !key.is_empty())
+            .collect();
+        if let Some(raw) = args
+            .tolerations
+            .as_deref()
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+        {
+            config.tolerations = serde_json::from_str(raw).map_err(|err| {
+                ServerError::UnsupportedConfig(format!(
+                    "SESSION_SANDBOX_TOLERATIONS must be a JSON array of toleration objects: {err}"
+                ))
+            })?;
+        }
         config.iron_proxy = args.iron_proxy.to_config()?;
         if let Some(proxy) = config.iron_proxy.as_mut() {
             // `to_config` only ships the harness fragment, so add infra and
@@ -2067,6 +2102,10 @@ mod tests {
             "github-access-token-read-packages, extra-secret ",
             "--session-sandbox-ready-timeout-secs",
             "42",
+            "--session-sandbox-node-selector",
+            "centaur-pool=true, cloud.google.com/gke-spot=true ",
+            "--session-sandbox-tolerations",
+            r#"[{"key":"centaur","operator":"Equal","value":"true","effect":"NoSchedule"}]"#,
             "--kubernetes-sandbox-iron-proxy-mode",
             "disabled",
         ])
@@ -2080,6 +2119,20 @@ mod tests {
             vec!["github-access-token-read-packages", "extra-secret"]
         );
         assert_eq!(config.ready_timeout, Duration::from_secs(42));
+        assert_eq!(
+            config.node_selector.get("centaur-pool").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            config
+                .node_selector
+                .get("cloud.google.com/gke-spot")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(config.tolerations.len(), 1);
+        assert_eq!(config.tolerations[0]["key"], "centaur");
+        assert_eq!(config.tolerations[0]["effect"], "NoSchedule");
         assert!(config.iron_proxy.is_none());
     }
 
