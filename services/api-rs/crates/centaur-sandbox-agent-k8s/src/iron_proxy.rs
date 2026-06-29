@@ -6,7 +6,7 @@ use centaur_sandbox_core::{SandboxError, SandboxId, SandboxResult, SandboxSpec};
 use k8s_openapi::api::core::v1::{
     Capabilities, Container, ContainerPort, EmptyDirVolumeSource, EnvFromSource,
     EnvVar as K8sEnvVar, HTTPGetAction, Pod, PodSpec, Probe, SecretEnvSource, SecretVolumeSource,
-    SecurityContext, Service, ServicePort, ServiceSpec, Volume, VolumeMount,
+    SecurityContext, Service, ServicePort, ServiceSpec, Toleration, Volume, VolumeMount,
 };
 use k8s_openapi::api::networking::v1::{
     NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,
@@ -83,6 +83,11 @@ pub struct IronProxyConfig {
     pub op_connect_app_name: String,
     pub op_connect_port: u16,
     pub api_pod_labels: BTreeMap<String, String>,
+    /// `nodeSelector` for the per-sandbox proxy pod. Mirrors the sandbox's so the
+    /// proxy lands on the same (e.g. spot) pool. Empty = none.
+    pub node_selector: BTreeMap<String, String>,
+    /// Tolerations for the per-sandbox proxy pod (verbatim JSON). Empty = none.
+    pub tolerations: Vec<Value>,
 }
 
 impl IronProxyConfig {
@@ -106,6 +111,8 @@ impl IronProxyConfig {
                 "app.kubernetes.io/component".to_owned(),
                 "api".to_owned(),
             )]),
+            node_selector: BTreeMap::new(),
+            tolerations: Vec::new(),
         }
     }
 }
@@ -1091,6 +1098,15 @@ fn build_iron_proxy_pod(
             restart_policy: Some("Never".to_owned()),
             containers: vec![iron_proxy_container(iron_proxy, resolved, sync)],
             volumes: Some(iron_proxy_volumes(iron_proxy)),
+            node_selector: (!iron_proxy.node_selector.is_empty())
+                .then(|| iron_proxy.node_selector.clone()),
+            tolerations: (!iron_proxy.tolerations.is_empty()).then(|| {
+                iron_proxy
+                    .tolerations
+                    .iter()
+                    .filter_map(|toleration| serde_json::from_value::<Toleration>(toleration.clone()).ok())
+                    .collect()
+            }),
             ..Default::default()
         }),
         ..Default::default()
@@ -1759,6 +1775,51 @@ mod tests {
             replace_placeholders: BTreeMap::new(),
             management_api_key: "test-management-key".to_owned(),
         }
+    }
+
+    #[test]
+    fn iron_proxy_pod_carries_node_selector_and_tolerations() {
+        let id = SandboxId::new("asbx-test");
+        let sync = ProxySyncEnv {
+            proxy_id: "proxy-1".to_owned(),
+            control_url: "http://console:3000".to_owned(),
+            token: "iprx-token".to_owned(),
+        };
+        let mut iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
+        iron_proxy
+            .node_selector
+            .insert("centaur-pool".to_owned(), "true".to_owned());
+        iron_proxy.tolerations.push(json!({
+            "key": "centaur",
+            "operator": "Equal",
+            "value": "true",
+            "effect": "NoSchedule",
+        }));
+
+        let pod = build_iron_proxy_pod(&id, &iron_proxy, &resolved(), &sync);
+        let spec = pod.spec.as_ref().unwrap();
+        assert_eq!(
+            spec.node_selector
+                .as_ref()
+                .and_then(|selector| selector.get("centaur-pool"))
+                .map(String::as_str),
+            Some("true")
+        );
+        let tolerations = spec.tolerations.as_ref().unwrap();
+        assert_eq!(tolerations.len(), 1);
+        assert_eq!(tolerations[0].key.as_deref(), Some("centaur"));
+        assert_eq!(tolerations[0].effect.as_deref(), Some("NoSchedule"));
+
+        // Absent by default: proxy pod stays schedulable anywhere when unset.
+        let bare = build_iron_proxy_pod(
+            &id,
+            &IronProxyConfig::new("proxy:test", "ca-cert", "ca-key"),
+            &resolved(),
+            &sync,
+        );
+        let bare_spec = bare.spec.as_ref().unwrap();
+        assert!(bare_spec.node_selector.is_none());
+        assert!(bare_spec.tolerations.is_none());
     }
 
     fn rule_allows_namespace_port(

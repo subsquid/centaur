@@ -1362,7 +1362,12 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
             })?;
         }
         config.iron_proxy = args.iron_proxy.to_config()?;
+        // The per-sandbox proxy pod follows the sandbox onto the same node pool.
+        let sandbox_node_selector = config.node_selector.clone();
+        let sandbox_tolerations = config.tolerations.clone();
         if let Some(proxy) = config.iron_proxy.as_mut() {
+            proxy.node_selector = sandbox_node_selector;
+            proxy.tolerations = sandbox_tolerations;
             // `to_config` only ships the harness fragment, so add infra and
             // discovered tool fragments for any static proxy placeholder
             // metadata the backend needs.
