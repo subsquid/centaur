@@ -256,7 +256,10 @@
         "extraEnv": {
           "type": "object",
           "additionalProperties": { "type": "string" }
-        }
+        },
+        "nodeSelector": { "type": "object" },
+        "tolerations": { "type": "array" },
+        "affinity": { "type": "object" }
       }
     },
     "slackbotv2": {
@@ -276,7 +279,10 @@
         "extraEnv": {
           "type": "object",
           "additionalProperties": { "type": "string" }
-        }
+        },
+        "nodeSelector": { "type": "object" },
+        "tolerations": { "type": "array" },
+        "affinity": { "type": "object" }
       }
     },
     "postgres": {
@@ -294,7 +300,10 @@
             "enabled": { "type": "boolean" },
             "sizeLimit": { "type": "string" }
           }
-        }
+        },
+        "nodeSelector": { "type": "object" },
+        "tolerations": { "type": "array" },
+        "affinity": { "type": "object" }
       }
     },
     "networkPolicy": {

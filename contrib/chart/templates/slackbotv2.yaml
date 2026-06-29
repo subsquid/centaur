@@ -32,6 +32,18 @@ spec:
       imagePullSecrets:
 {{ toYaml . | nindent 8 }}
       {{- end }}
+      {{- with .Values.slackbotv2.nodeSelector }}
+      nodeSelector:
+{{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.slackbotv2.affinity }}
+      affinity:
+{{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.slackbotv2.tolerations }}
+      tolerations:
+{{ toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: slackbotv2
           image: {{ printf "%s:%s" .Values.slackbotv2.image.repository .Values.slackbotv2.image.tag | quote }}

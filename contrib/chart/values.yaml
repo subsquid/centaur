@@ -346,6 +346,10 @@ apiRs:
   terminationGracePeriodSeconds: 35
   extraEnv: {}
   resources: {}
+  # Pin the control plane to specific nodes (e.g. a dedicated spot pool).
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
 
 # Chat SDK Slackbot v2. Forwards Slack events to the api-rs control plane
 # (:8080) and streams responses back. Listens on :3001.
@@ -368,6 +372,10 @@ slackbotv2:
     annotations: {}
   extraEnv: {}
   resources: {}
+  # Pin to specific nodes (e.g. a dedicated spot pool).
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
 
 # Chat SDK Linear bot — Linear agent (actor=app) ingress. Receives
 # AgentSessionEvent webhooks on /api/webhooks/linear, forwards sessions to the
@@ -456,6 +464,12 @@ postgres:
     enabled: true
     sizeLimit: 1Gi
   resources: {}
+  # Pin to specific nodes (e.g. a dedicated spot pool). Note: a StatefulSet's
+  # PVC binds to the node's zone, so keep the pool single-zone or use a
+  # multi-zone-aware storage class when pinning Postgres.
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
 
 ingress:
   enabled: false
